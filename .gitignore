@@ -36,3 +36,12 @@ docs/_build/
 _site/
 dist/
 *.zip
+
+# IDE / Editor (fleet template)
+.vscode/
+.idea/
+.claude/
+
+# Node.js / Composer (build tooling only)
+node_modules/
+vendor/
