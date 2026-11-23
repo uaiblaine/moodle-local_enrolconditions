@@ -14,23 +14,27 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <https://www.gnu.org/licenses/>.
 
-namespace enrolcond_userlist;
+namespace local_enrolconditions\condition;
 
-defined('MOODLE_INTERNAL') || die();
-
-global $CFG;
-require_once($CFG->libdir . '/formslib.php');
-
+use enrolcond_userlist\condition;
 /**
  * Tests of the list of usernames condition.
  *
- * @package    enrolcond_userlist
+ * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 #[\PHPUnit\Framework\Attributes\CoversClass(condition::class)]
+#[\PHPUnit\Framework\Attributes\CoversClass(\enrolcond_userlist\privacy\provider::class)]
 #[\PHPUnit\Framework\Attributes\CoversClass(\local_enrolconditions\local\usernames::class)]
-final class condition_test extends \advanced_testcase {
+final class userlist_test extends \advanced_testcase {
+    #[\Override]
+    public static function setUpBeforeClass(): void {
+        global $CFG;
+        require_once($CFG->libdir . '/formslib.php');
+        parent::setUpBeforeClass();
+    }
+
     public function test_is_met(): void {
         $this->resetAfterTest();
         $ana = $this->getDataGenerator()->create_user(['username' => 'ana']);
@@ -41,8 +45,38 @@ final class condition_test extends \advanced_testcase {
         $this->assertSame(['usernames' => ['ana', 'carla', 'davi']], $config);
         $this->assertTrue($condition->is_met((int) $ana->id, new \stdClass(), $config));
         $this->assertFalse($condition->is_met((int) $bia->id, new \stdClass(), $config));
-        $this->assertFalse($condition->is_met((int) $ana->id, new \stdClass(), []));
         $this->assertFalse($condition->is_met(999999, new \stdClass(), $config));
+    }
+
+    public function test_restore_from_another_site_is_unknown(): void {
+        $this->resetAfterTest();
+        $ana = $this->getDataGenerator()->create_user(['username' => 'ana']);
+        $condition = new condition();
+        $config = ['usernames' => ['ana', 'bia']];
+
+        // Control: from this site the list is kept.
+        $this->assertSame($config, $condition->restore_config($config, true));
+        $this->assertTrue($condition->is_met((int) $ana->id, new \stdClass(), $condition->restore_config($config, true)));
+
+        $restored = $condition->restore_config($config, false);
+        $this->assertSame(['usernames' => []], $restored);
+        try {
+            $condition->is_met((int) $ana->id, new \stdClass(), $restored);
+            $this->fail('An empty list must be unknown');
+        } catch (\moodle_exception $e) {
+            $this->assertSame('emptylist', $e->errorcode);
+        }
+    }
+
+    public function test_privacy(): void {
+        $this->assertTrue((new \core_privacy\manager())->component_is_compliant('enrolcond_userlist'));
+        $collection = \enrolcond_userlist\privacy\provider::get_metadata(
+            new \core_privacy\local\metadata\collection('enrolcond_userlist')
+        );
+        $items = $collection->get_collection();
+        $this->assertCount(1, $items);
+        $this->assertSame('enrol', $items[0]->get_name());
+        $this->assertSame(['usernames' => 'privacy:metadata:enrol:usernames'], $items[0]->get_privacy_fields());
     }
 
     public function test_description_and_form(): void {

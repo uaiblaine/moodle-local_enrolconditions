@@ -16,6 +16,7 @@
 
 namespace enrolcond_coursecompleted;
 
+use local_enrolconditions\condition\base;
 use MoodleQuickForm;
 use stdClass;
 
@@ -28,13 +29,15 @@ use stdClass;
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
-class condition extends \local_enrolconditions\condition\base {
+class condition extends base {
     #[\Override]
     public function is_met(int $userid, stdClass $instance, array $config): bool {
         global $DB;
         $courseid = (int) ($config['courseid'] ?? 0);
-        if ($courseid <= 0) {
-            return false;
+        if (!self::records_exist('course', [$courseid])) {
+            // A deleted course has no completion rows, which is not the same as "not completed": the condition is
+            // unknown (also after a restore from another site, which leaves id 0) until a teacher fixes it.
+            throw new \moodle_exception('missingcourse', 'enrolcond_coursecompleted');
         }
         return $DB->record_exists_select(
             'course_completions',
@@ -78,6 +81,22 @@ class condition extends \local_enrolconditions\condition\base {
             return ['courseid' => get_string('invalidcourse', 'enrolcond_coursecompleted')];
         }
         return [];
+    }
+
+    /**
+     * The course must be one the user may name ({@see base::can_reference_course()}).
+     *
+     * @param array $config
+     * @param \context $context Course context.
+     * @return string|null
+     */
+    #[\Override]
+    public function check_access(array $config, \context $context): ?string {
+        $courseid = (int) ($config['courseid'] ?? 0);
+        if ($courseid > 0 && !self::can_reference_course($courseid)) {
+            return get_string('noaccess', 'enrolcond_coursecompleted');
+        }
+        return null;
     }
 
     #[\Override]

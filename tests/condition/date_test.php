@@ -14,22 +14,25 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <https://www.gnu.org/licenses/>.
 
-namespace enrolcond_date;
+namespace local_enrolconditions\condition;
 
-defined('MOODLE_INTERNAL') || die();
-
-global $CFG;
-require_once($CFG->libdir . '/formslib.php');
-
+use enrolcond_date\condition;
 /**
  * Tests of the date condition.
  *
- * @package    enrolcond_date
+ * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 #[\PHPUnit\Framework\Attributes\CoversClass(condition::class)]
-final class condition_test extends \advanced_testcase {
+final class date_test extends \advanced_testcase {
+    #[\Override]
+    public static function setUpBeforeClass(): void {
+        global $CFG;
+        require_once($CFG->libdir . '/formslib.php');
+        parent::setUpBeforeClass();
+    }
+
     /**
      * Cases of is_met with the current time fixed at 1000.
      *
@@ -100,5 +103,9 @@ final class condition_test extends \advanced_testcase {
         (new condition())->config_form_definition($form);
         $this->assertTrue($form->elementExists('from'));
         $this->assertTrue($form->elementExists('to'));
+    }
+
+    public function test_privacy_is_compliant(): void {
+        $this->assertTrue((new \core_privacy\manager())->component_is_compliant('enrolcond_date'));
     }
 }

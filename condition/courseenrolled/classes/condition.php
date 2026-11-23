@@ -16,6 +16,7 @@
 
 namespace enrolcond_courseenrolled;
 
+use local_enrolconditions\condition\base;
 use MoodleQuickForm;
 use stdClass;
 
@@ -24,11 +25,15 @@ use stdClass;
  *
  * Configuration: ['courseids' => int[], 'mode' => 'any'|'all', 'active' => 0|1].
  *
+ * A course of the list that no longer exists (or an empty list, as a restore from another site leaves it) makes the
+ * condition unknown in either mode, never not met: a partial list cannot be trusted, since "any" would answer for a
+ * shorter list than the teacher wrote and "all" could never be met.
+ *
  * @package    enrolcond_courseenrolled
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
-class condition extends \local_enrolconditions\condition\base {
+class condition extends base {
     /** @var int Most courses in one condition. */
     public const MAX_COURSES = 50;
 
@@ -63,8 +68,11 @@ class condition extends \local_enrolconditions\condition\base {
     public function is_met(int $userid, stdClass $instance, array $config): bool {
         global $DB;
         $courseids = $this->course_ids($config);
-        if (!$courseids) {
-            return false;
+        // Any missing course makes the whole condition unknown, in both modes: with the course gone, "any"
+        // would trust a shorter list than the teacher wrote and "all" could never be met, and neither
+        // answer is the teacher's. Also the case of the empty list a restore from another site leaves.
+        if (!$courseids || !self::records_exist('course', $courseids)) {
+            throw new \moodle_exception('missingcourse', 'enrolcond_courseenrolled');
         }
         [$insql, $params] = $DB->get_in_or_equal($courseids, SQL_PARAMS_NAMED, 'course');
         $params['userid'] = $userid;
@@ -109,8 +117,10 @@ class condition extends \local_enrolconditions\condition\base {
         if (count($names) <= 1) {
             return get_string('descone', 'enrolcond_courseenrolled', $names ? $names[0] : '-');
         }
-        $string = $this->mode($config) === self::MODE_ALL ? 'descall' : 'descany';
-        return get_string($string, 'enrolcond_courseenrolled', implode('; ', $names));
+        if ($this->mode($config) === self::MODE_ALL) {
+            return get_string('descall', 'enrolcond_courseenrolled', implode('; ', $names));
+        }
+        return get_string('descany', 'enrolcond_courseenrolled', implode('; ', $names));
     }
 
     #[\Override]
@@ -159,6 +169,24 @@ class condition extends \local_enrolconditions\condition\base {
             return ['courseids' => get_string('invalidcourse', 'enrolcond_courseenrolled')];
         }
         return [];
+    }
+
+    /**
+     * Every course must be one the user may name ({@see base::can_reference_course()}).
+     *
+     * @param array $config
+     * @param \context $context Course context.
+     * @return string|null
+     */
+    #[\Override]
+    public function check_access(array $config, \context $context): ?string {
+        // Bounded by validate_config(), but a submitted tree is checked before it is validated.
+        foreach (array_slice($this->course_ids($config), 0, self::MAX_COURSES + 1) as $courseid) {
+            if (!self::can_reference_course($courseid)) {
+                return get_string('noaccess', 'enrolcond_courseenrolled');
+            }
+        }
+        return null;
     }
 
     #[\Override]

@@ -14,22 +14,26 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <https://www.gnu.org/licenses/>.
 
-namespace enrolcond_coursecompleted;
+namespace local_enrolconditions\condition;
 
-defined('MOODLE_INTERNAL') || die();
-
-global $CFG;
-require_once($CFG->libdir . '/formslib.php');
-
+use enrolcond_coursecompleted\condition;
+use local_enrolconditions\tree;
 /**
  * Tests of the course completed condition.
  *
- * @package    enrolcond_coursecompleted
+ * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 #[\PHPUnit\Framework\Attributes\CoversClass(condition::class)]
-final class condition_test extends \advanced_testcase {
+final class coursecompleted_test extends \advanced_testcase {
+    #[\Override]
+    public static function setUpBeforeClass(): void {
+        global $CFG;
+        require_once($CFG->libdir . '/formslib.php');
+        parent::setUpBeforeClass();
+    }
+
     public function test_is_met(): void {
         global $CFG;
         require_once($CFG->dirroot . '/completion/completion_completion.php');
@@ -51,12 +55,74 @@ final class condition_test extends \advanced_testcase {
         $config = ['courseid' => (int) $course->id];
         $this->assertTrue($condition->is_met((int) $completed->id, new \stdClass(), $config));
         $this->assertFalse($condition->is_met((int) $started->id, new \stdClass(), $config));
-        $this->assertFalse($condition->is_met((int) $completed->id, new \stdClass(), []));
 
         // The event observed by the condition concerns the user who completed.
         $observed = array_filter($events, fn($e) => in_array(get_class($e), $condition->get_observed_events(), true));
         $this->assertCount(1, $observed);
         $this->assertEquals($completed->id, reset($observed)->relateduserid);
+    }
+
+    /**
+     * Value of a tree with one course completed condition for a user, through the tree.
+     *
+     * @param array $config
+     * @param int $userid
+     * @param bool $negate
+     * @return bool|null Null when unknown; the debugging message of the failed condition is consumed.
+     */
+    protected function tree_value(array $config, int $userid, bool $negate = false): ?bool {
+        $root = ['op' => 'and', 'children' => [['type' => 'coursecompleted', 'negate' => $negate, 'config' => $config]]];
+        $value = tree::from_array($root)->evaluate($userid, (object) ['id' => 0, 'courseid' => SITEID])->get_value();
+        if ($value === null) {
+            $this->assertDebuggingCalled();
+        }
+        return $value;
+    }
+
+    public function test_deleted_course_is_unknown_not_unmet(): void {
+        global $CFG;
+        require_once($CFG->dirroot . '/completion/completion_completion.php');
+        $this->resetAfterTest();
+        $CFG->enablecompletion = 1;
+        $course = $this->getDataGenerator()->create_course(['enablecompletion' => 1]);
+        $user = $this->getDataGenerator()->create_user();
+        $other = $this->getDataGenerator()->create_user();
+        $this->getDataGenerator()->enrol_user($user->id, $course->id);
+        (new \completion_completion(['userid' => $user->id, 'course' => $course->id]))->mark_complete();
+        $config = ['courseid' => (int) $course->id];
+
+        // Control: while the course exists, completed is met and not completed is not met, negated or not.
+        $this->assertTrue($this->tree_value($config, (int) $user->id));
+        $this->assertFalse($this->tree_value($config, (int) $other->id));
+        $this->assertFalse($this->tree_value($config, (int) $user->id, true));
+        $this->assertTrue($this->tree_value($config, (int) $other->id, true));
+
+        delete_course($course, false);
+        condition::reset_existence_cache();
+        $this->assertNull($this->tree_value($config, (int) $user->id));
+        $this->assertNull($this->tree_value($config, (int) $other->id));
+        $this->assertNull($this->tree_value($config, (int) $other->id, true));
+        try {
+            (new condition())->is_met((int) $user->id, new \stdClass(), $config);
+            $this->fail('A deleted course cannot be evaluated');
+        } catch (\moodle_exception $e) {
+            $this->assertSame('missingcourse', $e->errorcode);
+        }
+    }
+
+    public function test_course_id_zero_from_another_site_is_unknown(): void {
+        $this->resetAfterTest();
+        $user = $this->getDataGenerator()->create_user();
+        $restored = (new condition())->restore_config(['courseid' => 5], false);
+        $this->assertSame(['courseid' => 0], $restored);
+
+        $this->assertNull($this->tree_value($restored, (int) $user->id));
+        $this->assertNull($this->tree_value($restored, (int) $user->id, true));
+        $this->assertNull($this->tree_value([], (int) $user->id));
+        // Control: the same site keeps the course, which evaluates.
+        $course = $this->getDataGenerator()->create_course();
+        $kept = (new condition())->restore_config(['courseid' => (int) $course->id], true);
+        $this->assertFalse($this->tree_value($kept, (int) $user->id));
     }
 
     public function test_description(): void {
@@ -85,5 +151,34 @@ final class condition_test extends \advanced_testcase {
         $condition->config_form_definition($form);
         $this->assertTrue($form->elementExists('courseid'));
         $this->assertSame('coursecompleted', $condition->get_type());
+    }
+
+    public function test_check_access_follows_course_visibility(): void {
+        $this->resetAfterTest();
+        $generator = $this->getDataGenerator();
+        $course = $generator->create_course();
+        $context = \context_course::instance($course->id);
+        $teacher = $generator->create_and_enrol($course, 'editingteacher');
+        $hidden = $generator->create_course(['visible' => 0]);
+        $enrolledhidden = $generator->create_course(['visible' => 0]);
+        $generator->enrol_user($teacher->id, $enrolledhidden->id, 'student');
+        $visible = $generator->create_course();
+        $condition = new condition();
+
+        $this->setUser($teacher);
+        $this->assertSame(
+            get_string('noaccess', 'enrolcond_coursecompleted'),
+            $condition->check_access(['courseid' => $hidden->id], $context)
+        );
+        $this->assertNotNull($condition->check_access(['courseid' => 999999], $context));
+        // Controls: a visible course, and a hidden course the teacher is enrolled in (core's course element shows both).
+        $this->assertNull($condition->check_access(['courseid' => $visible->id], $context));
+        $this->assertNull($condition->check_access(['courseid' => $enrolledhidden->id], $context));
+        $this->setAdminUser();
+        $this->assertNull($condition->check_access(['courseid' => $hidden->id], $context));
+    }
+
+    public function test_privacy_is_compliant(): void {
+        $this->assertTrue((new \core_privacy\manager())->component_is_compliant('enrolcond_coursecompleted'));
     }
 }

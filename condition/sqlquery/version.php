@@ -25,7 +25,7 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'enrolcond_sqlquery';
-$plugin->version = 2026110901;
+$plugin->version = 2026112300;
 $plugin->requires = 2026100200;
 $plugin->supported = [503, 503];
 $plugin->release = '1.0.0';

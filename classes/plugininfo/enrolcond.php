@@ -116,6 +116,8 @@ class enrolcond extends \core\plugininfo\base {
     /**
      * Enables or disables a condition.
      *
+     * Purges the enforcer's cache of observed events, which depends on the enabled types.
+     *
      * @param string $pluginname Condition name, without the enrolcond_ prefix.
      * @param int $enabled 1 to enable, 0 to disable.
      * @return bool Whether the setting changed.
@@ -134,6 +136,8 @@ class enrolcond extends \core\plugininfo\base {
         }
         add_to_config_log('disabled', (int) $olddisabled, (int) $disabled, $component);
         \core_plugin_manager::reset_caches();
+        // The enforcer's map of observed events is built from the enabled condition types; purge it on every node.
+        \local_enrolconditions\local\enforcer::purge_event_map();
         return true;
     }
 }

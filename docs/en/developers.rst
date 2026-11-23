@@ -61,7 +61,7 @@ Optional methods:
    Form validation; by default it calls ``validate_config()``.
 
 ``get_observed_events(): array``
-   Events (fully qualified class names) that may change the result for a user. ``enrol_conditional`` observes every event and checks the enrolments of the event's related user (or of its user) in the methods whose conditions observe it. No ``db/events.php`` is needed in the plugin that provides the condition.
+   Events (fully qualified class names) that may change the result for a user. The engine observes every event and, for an event a condition observes, queues an ad hoc task that re-checks the enrolments of the event's related user (or of its user) in the instances that re-check on events. No ``db/events.php`` is needed in the plugin that provides the condition.
 
 ``restore_config(array $config, bool $samesite): array``
    Configuration for a course restored from a backup. Override when it refers to records the backup does not carry (cohorts, other courses): from another site, make the condition fail instead of pointing to an unrelated record.
@@ -144,7 +144,7 @@ An enrolment method gets the same re-checks as ``enrol_conditional`` (at login, 
 
 While the enrolment method is enabled, ``local_enrolconditions``:
 
-* re-checks its enrolments in the scheduled task (``CHECK_PERIODIC``) and when an event observed by the conditions happens (``CHECK_EVENTS``); the cache of observed events is cleared whenever an enrolment instance is created, updated or deleted;
+* re-checks its enrolments in the scheduled task (``CHECK_PERIODIC``) and, in an ad hoc task, after an event observed by the conditions happens (``CHECK_EVENTS``); the cache of observed events is cleared whenever an instance of an enforceable method is created, updated or deleted, and when a condition type is enabled or disabled;
 * applies the action of the instance with the standard ``update_user_enrol()`` and ``unenrol_user()`` of the plugin;
 * only reactivates the enrolments that it suspended itself and that nobody changed since, recorded in ``local_enrolconditions_state`` with the name of the method;
 * triggers ``\local_enrolconditions\event\user_enrolment_suspended``, ``user_enrolment_reactivated`` and ``conditions_not_met``, with the method in ``other['enrol']``;

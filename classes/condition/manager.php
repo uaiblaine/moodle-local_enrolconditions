@@ -17,11 +17,14 @@
 namespace local_enrolconditions\condition;
 
 use coding_exception;
+use local_enrolconditions\enforceable;
 use local_enrolconditions\hook\collect_conditions;
 use local_enrolconditions\plugininfo\enrolcond;
+use local_enrolconditions\tree;
 
 /**
- * Finds the available conditions: enrolcond subplugins and conditions provided through the hook.
+ * Finds the available conditions (enrolcond subplugins and conditions provided through the hook) and the
+ * enrolment methods that store condition trees (implementations of \local_enrolconditions\enforceable).
  *
  * Subplugins can be disabled by the administrator. Conditions provided through the hook follow the
  * plugin that provides them: they are available while that plugin is installed.
@@ -39,6 +42,9 @@ class manager {
 
     /** @var array<string, base> Conditions registered by unit tests, keyed by type. */
     protected static array $testconditions = [];
+
+    /** @var array<string, enforceable> Enrolment methods registered by unit tests, keyed by name. */
+    protected static array $testenforceables = [];
 
     /**
      * Condition of the given type.
@@ -112,12 +118,98 @@ class manager {
     }
 
     /**
-     * Forgets the loaded conditions and the ones registered by unit tests.
+     * Registers an enrolment method that stores condition trees, for unit tests, without an installed plugin.
+     *
+     * It replaces the installed method of the same name for every lookup of this class.
+     *
+     * @param string $name Enrolment method name, as in the enrol column of the enrol table.
+     * @param enforceable $plugin
+     * @throws coding_exception Outside unit tests.
+     */
+    public static function register_enforceable_for_testing(string $name, enforceable $plugin): void {
+        if (!defined('PHPUNIT_TEST') || !PHPUNIT_TEST) {
+            throw new coding_exception('register_enforceable_for_testing() is only allowed in unit tests');
+        }
+        static::$testenforceables[$name] = $plugin;
+    }
+
+    /**
+     * Forgets the loaded conditions and the conditions and methods registered by unit tests.
      */
     public static function reset_caches(): void {
         static::$subplugins = [];
         static::$hooked = null;
         static::$testconditions = [];
+        static::$testenforceables = [];
+    }
+
+    /**
+     * Installed enrolment methods that store condition trees, enabled or not.
+     *
+     * Disabled methods are included: their instances keep their trees (and the files those trees refer to) and
+     * can be enabled again.
+     *
+     * @return array<string, enforceable> Keyed by enrolment method name.
+     */
+    public static function get_enforceable_plugins(): array {
+        $plugins = [];
+        foreach (enrol_get_plugins(false) as $name => $plugin) {
+            if ($plugin instanceof enforceable) {
+                $plugins[$name] = $plugin;
+            }
+        }
+        return static::$testenforceables + $plugins;
+    }
+
+    /**
+     * Installed enrolment method that stores condition trees, by name.
+     *
+     * @param string $name Enrolment method name.
+     * @return enforceable|null Null when no such method is installed or it does not store condition trees.
+     */
+    public static function get_enforceable(string $name): ?enforceable {
+        if (isset(static::$testenforceables[$name])) {
+            return static::$testenforceables[$name];
+        }
+        $plugin = $name === '' ? null : enrol_get_plugin($name);
+        return $plugin instanceof enforceable ? $plugin : null;
+    }
+
+    /**
+     * Stored condition tree of an enrolment instance.
+     *
+     * @param \stdClass $instance Record of the enrol table.
+     * @return tree|null Null when its method does not store condition trees or the stored tree is not valid.
+     */
+    public static function get_instance_tree(\stdClass $instance): ?tree {
+        $plugin = static::get_enforceable((string) $instance->enrol);
+        if (!$plugin) {
+            return null;
+        }
+        try {
+            return tree::from_json($plugin->get_enforcement_tree($instance));
+        } catch (\local_enrolconditions\invalid_tree_exception $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Stored condition trees of every instance of a course, through the methods' own API.
+     *
+     * Instances of every method that stores condition trees count, enabled or not.
+     *
+     * @param int $courseid
+     * @return array<int, tree> Keyed by enrolment instance id; instances without a valid tree are left out.
+     */
+    public static function get_course_trees(int $courseid): array {
+        $trees = [];
+        foreach (enrol_get_instances($courseid, false) as $instance) {
+            $tree = static::get_instance_tree($instance);
+            if ($tree && !$tree->is_empty()) {
+                $trees[(int) $instance->id] = $tree;
+            }
+        }
+        return $trees;
     }
 
     /**

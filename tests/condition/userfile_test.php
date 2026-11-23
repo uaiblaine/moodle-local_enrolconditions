@@ -14,30 +14,63 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <https://www.gnu.org/licenses/>.
 
-namespace enrolcond_userfile;
+namespace local_enrolconditions\condition;
 
+use enrolcond_userfile\condition;
 use core_privacy\local\request\approved_contextlist;
 use core_privacy\local\request\approved_userlist;
 use core_privacy\local\request\userlist;
 use core_privacy\local\request\writer;
 use enrolcond_userfile\privacy\provider;
 
-defined('MOODLE_INTERNAL') || die();
-
-global $CFG;
-require_once($CFG->libdir . '/formslib.php');
-
 /**
  * Tests of the file of usernames condition, its cleanup task and its privacy provider.
  *
- * @package    enrolcond_userfile
+ * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 #[\PHPUnit\Framework\Attributes\CoversClass(condition::class)]
-#[\PHPUnit\Framework\Attributes\CoversClass(task\cleanup_files::class)]
+#[\PHPUnit\Framework\Attributes\CoversClass(\enrolcond_userfile\task\cleanup_files::class)]
 #[\PHPUnit\Framework\Attributes\CoversClass(provider::class)]
-final class condition_test extends \core_privacy\tests\provider_testcase {
+final class userfile_test extends \core_privacy\tests\provider_testcase {
+    #[\Override]
+    public static function setUpBeforeClass(): void {
+        global $CFG;
+        require_once($CFG->libdir . '/formslib.php');
+        require_once($CFG->dirroot . '/local/enrolconditions/tests/fixtures/fake_enforceable.php');
+        parent::setUpBeforeClass();
+    }
+
+    #[\Override]
+    public function tearDown(): void {
+        \local_enrolconditions\condition\manager::reset_caches();
+        parent::tearDown();
+    }
+
+    /**
+     * Makes the manual instances of the site store their condition tree in customtext1.
+     */
+    protected function use_fake_enforceable(): void {
+        \local_enrolconditions\condition\manager::register_enforceable_for_testing(
+            'manual',
+            new \local_enrolconditions_fake_enforceable()
+        );
+    }
+
+    /**
+     * Stores a tree with one userfile condition in the manual instance of a course.
+     *
+     * @param \stdClass $course
+     * @param array $config
+     */
+    protected function store(\stdClass $course, array $config): void {
+        global $DB;
+        $DB->set_field('enrol', 'customtext1', json_encode(['op' => 'and', 'children' => [
+            ['type' => 'userfile', 'config' => $config],
+        ]]), ['courseid' => $course->id, 'enrol' => 'manual']);
+    }
+
     /**
      * Puts a file in a new draft area of the current user.
      *
@@ -64,7 +97,7 @@ final class condition_test extends \core_privacy\tests\provider_testcase {
      *
      * @param \stdClass $course
      * @param string $content
-     * @param int $fileid Existing file id, 0 for a new condition.
+     * @param int $fileid File id posted with the form, which must be ignored.
      * @return array Configuration.
      */
     protected function save(\stdClass $course, string $content, int $fileid = 0): array {
@@ -97,15 +130,16 @@ final class condition_test extends \core_privacy\tests\provider_testcase {
         $this->assertFalse($condition->is_met((int) $bia->id, $instance, $config));
         $this->assertSame('Your username is in the file students.csv (2 users)', $condition->get_summary($config));
 
-        // Replacing the file keeps the id and changes the list.
+        // Replacing the file stores it under a new id, even when the old id is posted: the stored list is untouched.
         $config2 = $this->save($course, "bia\n", $config['fileid']);
-        $this->assertSame($config['fileid'], $config2['fileid']);
+        $this->assertNotSame($config['fileid'], $config2['fileid']);
         $this->assertTrue($condition->is_met((int) $bia->id, $instance, $config2));
         $this->assertFalse($condition->is_met((int) $ana->id, $instance, $config2));
+        $this->assertTrue($condition->is_met((int) $ana->id, $instance, $config));
 
         // The form shows the current file.
         $data = $condition->config_to_form_data_in_context($config2, \context_course::instance($course->id));
-        $this->assertSame($config['fileid'], $data['fileid']);
+        $this->assertArrayNotHasKey('fileid', $data);
         global $USER;
         $draftfiles = get_file_storage()->get_area_files(
             \context_user::instance($USER->id)->id,
@@ -144,21 +178,21 @@ final class condition_test extends \core_privacy\tests\provider_testcase {
         $form = new \MoodleQuickForm('test', 'post', '');
         $condition->config_form_definition($form);
         $this->assertTrue($form->elementExists('usernamesfile'));
-        $this->assertTrue($form->elementExists('fileid'));
+        // The item id is never taken from the form.
+        $this->assertFalse($form->elementExists('fileid'));
     }
 
     public function test_cleanup_task(): void {
         global $DB;
         $this->resetAfterTest();
         $this->setAdminUser();
+        $this->use_fake_enforceable();
         $course = $this->getDataGenerator()->create_course();
         $used = $this->save($course, "ana\n");
         $unused = $this->save($course, "bia\n");
         $recent = $this->save($course, "carla\n");
-        $DB->set_field('enrol', 'customtext2', json_encode(['op' => 'and', 'children' => [
-            ['type' => 'userfile', 'config' => $used],
-        ]]), ['courseid' => $course->id, 'enrol' => 'manual']);
-        $DB->set_field('enrol', 'enrol', 'conditional', ['courseid' => $course->id, 'enrol' => 'manual']);
+        // The tree is read through the method's own API (customtext1 here), not from a fixed column.
+        $this->store($course, $used);
         $DB->set_field_select(
             'files',
             'timemodified',
@@ -168,11 +202,95 @@ final class condition_test extends \core_privacy\tests\provider_testcase {
         );
 
         $this->expectOutputRegex('/1 files of usernames deleted/');
-        (new task\cleanup_files())->execute();
+        (new \enrolcond_userfile\task\cleanup_files())->execute();
         $context = \context_course::instance($course->id);
         $this->assertNotNull(condition::get_file($used, $context));
         $this->assertNull(condition::get_file($unused, $context));
         $this->assertNotNull(condition::get_file($recent, $context));
+    }
+
+    public function test_check_access_refuses_a_file_another_tree_uses(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $context = \context_course::instance($course->id);
+        $condition = new condition();
+        $stored = $this->save($course, "ana\n");
+        $fresh = $this->save($course, "bia\n");
+        $this->store($course, $stored);
+
+        $this->assertSame(get_string('noaccess', condition::COMPONENT), $condition->check_access($stored, $context));
+        // Control: the file the dialog has just stored, which no tree uses yet.
+        $this->assertNull($condition->check_access($fresh, $context));
+        // A file of another course is not found in this one.
+        $other = \context_course::instance($this->getDataGenerator()->create_course()->id);
+        $this->assertNotNull($condition->check_access($fresh, $other));
+    }
+
+    public function test_restore_from_another_site_drops_the_file(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $course = $this->getDataGenerator()->create_course();
+        $ana = $this->getDataGenerator()->create_user(['username' => 'ana']);
+        $instance = (object) ['courseid' => $course->id];
+        $condition = new condition();
+        $config = $this->save($course, "ana\n");
+
+        // Control: from this site the configuration is kept.
+        $this->assertTrue($condition->is_met((int) $ana->id, $instance, $condition->restore_config($config, true)));
+
+        $restored = $condition->restore_config($config, false);
+        $this->assertSame(['fileid' => 0, 'filename' => '', 'count' => 0], $restored);
+        $this->expectException(\moodle_exception::class);
+        $condition->is_met((int) $ana->id, $instance, $restored);
+    }
+
+    public function test_privacy_erases_a_deleted_user(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $course = $this->getDataGenerator()->create_course();
+        $context = \context_course::instance($course->id);
+        $ana = $this->getDataGenerator()->create_user(['username' => 'ana']);
+        $bia = $this->getDataGenerator()->create_user(['username' => 'bia']);
+        $config = $this->save($course, "username\nana\nbia\n");
+        delete_user($ana);
+        $hash = condition::get_file($config, $context)->get_contenthash();
+        $this->assertArrayHasKey('ana', condition::get_usernames(condition::get_file($config, $context)));
+
+        // The deleted account is found by core's md5 of its username, through the finder and the userlist.
+        $contextids = provider::get_contexts_for_userid((int) $ana->id)->get_contextids();
+        $this->assertEquals([$context->id], $contextids);
+        $userlist = new userlist($context, condition::COMPONENT);
+        provider::get_users_in_context($userlist);
+        $this->assertEqualsCanonicalizing([$ana->id, $bia->id], $userlist->get_userids());
+        $this->assertNotFalse(\cache::make(condition::COMPONENT, 'usernames')->get($hash));
+
+        provider::delete_data_for_user(new approved_contextlist($ana, condition::COMPONENT, $contextids));
+        $this->assertSame("username\nbia\n", condition::get_file($config, $context)->get_content());
+        // The list of the old content is gone from the shared cache too.
+        $this->assertFalse(\cache::make(condition::COMPONENT, 'usernames')->get($hash));
+        $this->assertSame([], provider::get_contexts_for_userid((int) $ana->id)->get_contextids());
+        // Control: the user still listed is still found.
+        $this->assertEquals([$context->id], provider::get_contexts_for_userid((int) $bia->id)->get_contextids());
+    }
+
+    public function test_privacy_userlist_erases_a_deleted_user(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $course = $this->getDataGenerator()->create_course();
+        $context = \context_course::instance($course->id);
+        $ana = $this->getDataGenerator()->create_user(['username' => 'ana']);
+        $bia = $this->getDataGenerator()->create_user(['username' => 'bia']);
+        $config = $this->save($course, "ana\nbia\ncarla\n");
+        delete_user($ana);
+
+        provider::delete_data_for_users(new approved_userlist($context, condition::COMPONENT, [$ana->id, $bia->id]));
+        $this->assertSame("carla\n", condition::get_file($config, $context)->get_content());
+    }
+
+    public function test_privacy_is_compliant(): void {
+        $this->assertTrue((new \core_privacy\manager())->component_is_compliant(condition::COMPONENT));
     }
 
     public function test_privacy(): void {

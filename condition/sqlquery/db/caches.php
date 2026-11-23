@@ -25,9 +25,12 @@
 defined('MOODLE_INTERNAL') || die();
 
 $definitions = [
-    // Results of the queries by SQL and course, with the time they were read (setting cachettl).
+    // Results of the queries by SQL (and course, when the SQL uses :courseid), with the time they were read. The
+    // setting cachettl decides when an entry is refreshed; the time to live is the upper bound after which the
+    // store evicts it, also when cachettl is 0 or the query was removed.
     'results' => [
         'mode' => cache_store::MODE_APPLICATION,
         'simplekeys' => true,
+        'ttl' => 86400,
     ],
 ];

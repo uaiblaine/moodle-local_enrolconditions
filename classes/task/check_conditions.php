@@ -19,13 +19,22 @@ namespace local_enrolconditions\task;
 use local_enrolconditions\local\enforcer;
 
 /**
- * Re-checks, in batches, the enrolments of the instances with the periodic check mode.
+ * Re-checks the enrolments of the instances with the periodic check mode, in chunks, within a time budget.
+ *
+ * Each run continues the cycle where the previous one stopped (the position is in the plugin settings, shared by
+ * every node) and stops when the budget (checktimelimit) is spent or the cycle is complete.
  *
  * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 class check_conditions extends \core\task\scheduled_task {
+    /** @var int Default chunk size. */
+    public const DEFAULT_CHUNK = 500;
+
+    /** @var int Default time budget of a run, in seconds. */
+    public const DEFAULT_TIME_LIMIT = 60;
+
     #[\Override]
     public function get_name() {
         return get_string('checkconditionstask', 'local_enrolconditions');
@@ -38,8 +47,12 @@ class check_conditions extends \core\task\scheduled_task {
             mtrace('No enabled enrolment method re-checks conditions.');
             return;
         }
-        $limit = (int) get_config('local_enrolconditions', 'checkbatchsize') ?: 500;
-        $outcomes = $enforcer->check_batch($limit, new \text_progress_trace());
-        mtrace(count($outcomes) . ' enrolments checked.');
+        $chunk = (int) get_config('local_enrolconditions', 'checkbatchsize') ?: self::DEFAULT_CHUNK;
+        $timelimit = get_config('local_enrolconditions', 'checktimelimit');
+        $timelimit = ($timelimit === false || $timelimit === '') ? self::DEFAULT_TIME_LIMIT : max(0, (int) $timelimit);
+        $outcomes = $enforcer->check_periodic($chunk, $timelimit, new \text_progress_trace());
+        [$instanceid, $userid] = enforcer::get_position();
+        $where = $instanceid ? "the next run continues at instance {$instanceid}, after user {$userid}" : 'the cycle is complete';
+        mtrace(count($outcomes) . " enrolments checked; {$where}.");
     }
 }

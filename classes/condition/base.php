@@ -40,6 +40,9 @@ abstract class base {
      * @param stdClass $instance Enrolment instance (record of the enrol table).
      * @param array $config Configuration of this use of the condition.
      * @return bool
+     * @throws \moodle_exception When the condition cannot be evaluated (the list, file or record it names is
+     *         missing): {@see \local_enrolconditions\tree} turns it into "unknown", which refuses new enrolments
+     *         and never suspends, removes or reactivates anybody. Answering false instead would do all three.
      */
     abstract public function is_met(int $userid, stdClass $instance, array $config): bool;
 
@@ -79,6 +82,26 @@ abstract class base {
      * @return array<string, string> Errors keyed by form field name; empty when valid.
      */
     abstract public function validate_config(array $config): array;
+
+    /**
+     * Whether the current user may reference what a configuration names, from a course.
+     *
+     * validate_config() says whether a configuration is well formed; this says whether the user writing it may
+     * point at the records it names (a cohort, another course, a file), since the description of the condition
+     * shows their names to the teacher and to every user who fails it. It runs for every condition a user adds
+     * or changes: in the configuration dialog, before its summary is returned, and on the save of a tree, for
+     * each node that is not already stored unchanged ({@see editor_access::check_node()}). A node already stored
+     * is never asked again, so a tree an administrator wrote stays editable by a teacher.
+     *
+     * Override when the configuration names records whose visibility depends on the user.
+     *
+     * @param array $config Configuration, already valid for validate_config().
+     * @param \context $context Course context of the enrolment instance.
+     * @return string|null Localised error when the user may not reference it; null when they may.
+     */
+    public function check_access(array $config, \context $context): ?string {
+        return null;
+    }
 
     /**
      * Turns a stored configuration into default values for the configuration form.
@@ -140,6 +163,89 @@ abstract class base {
      */
     public function get_observed_events(): array {
         return [];
+    }
+
+    /**
+     * Whether the current user may name a course in a condition ({@see check_access()}).
+     *
+     * Mirrors the rule of core's course form element (MoodleQuickForm_course::setValue()), the element that picks
+     * courses in the dialogs: the user is enrolled in the course or core_course_category::can_view_course_info()
+     * allows it. Keep the two in step.
+     *
+     * @param int $courseid
+     * @return bool False as well when the course does not exist.
+     */
+    protected static function can_reference_course(int $courseid): bool {
+        global $DB, $USER;
+        $course = $courseid > 0 ? $DB->get_record('course', ['id' => $courseid], 'id, category, visible') : false;
+        if (!$course) {
+            return false;
+        }
+        return \core_course_category::can_view_course_info($course)
+            || is_enrolled(\context_course::instance($courseid), $USER, '', true);
+    }
+
+    /**
+     * Whether every record of a table exists, answered once per request for each id.
+     *
+     * The periodic re-check evaluates one condition for every participant of an instance, so the existence
+     * of the cohort, course or field it names is looked up once and kept in a request cache (never shared: a
+     * deletion is seen by the next request). Ids that are not positive do not exist.
+     *
+     * @param string $table Table without prefix, with an id column.
+     * @param int[] $ids
+     * @return bool False when any id is missing; true for an empty list.
+     */
+    protected static function records_exist(string $table, array $ids): bool {
+        global $DB;
+        $cache = self::existence_cache();
+        $unknown = [];
+        foreach (array_unique($ids) as $id) {
+            if ($id <= 0) {
+                return false;
+            }
+            $known = $cache->get($table . '_' . $id);
+            if ($known === false) {
+                $unknown[] = $id;
+            } else if (!$known) {
+                return false;
+            }
+        }
+        if ($unknown) {
+            [$insql, $params] = $DB->get_in_or_equal($unknown);
+            $found = $DB->get_fieldset_select($table, 'id', "id $insql", $params);
+            $found = array_map('intval', $found);
+            $all = true;
+            foreach ($unknown as $id) {
+                $exists = in_array($id, $found, true);
+                $cache->set($table . '_' . $id, $exists ? 1 : 0);
+                $all = $all && $exists;
+            }
+            return $all;
+        }
+        return true;
+    }
+
+    /**
+     * Forgets what {@see records_exist()} knows, for code that deletes a record and evaluates in the same request.
+     */
+    public static function reset_existence_cache(): void {
+        self::existence_cache()->purge();
+    }
+
+    /**
+     * Request cache of {@see records_exist()}.
+     *
+     * @return \cache
+     */
+    private static function existence_cache(): \cache {
+        return \cache::make_from_params(
+            \cache_store::MODE_REQUEST,
+            'local_enrolconditions',
+            'recordexists',
+            [],
+            ['simplekeys' => true, 'simpledata' => true]
+        );
     }
 
     /**

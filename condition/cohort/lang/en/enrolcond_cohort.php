@@ -22,9 +22,13 @@
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 
+defined('MOODLE_INTERNAL') || die();
+
 $string['desc'] = 'You are a member of the cohort {$a}';
 $string['descmissing'] = 'You are a member of a cohort that no longer exists (id {$a})';
 $string['invalidcohort'] = 'Choose a cohort.';
+$string['missingcohort'] = 'The cohort of this condition no longer exists; a teacher must choose another one.';
+$string['noaccess'] = 'You cannot use this cohort in this course. Choose one of the cohorts offered.';
 $string['nocohorts'] = 'There are no cohorts available in this course.';
 $string['pluginname'] = 'Cohort';
 $string['privacy:metadata'] = 'The Cohort enrolment condition does not store any personal data.';

@@ -14,22 +14,26 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <https://www.gnu.org/licenses/>.
 
-namespace enrolcond_courseenrolled;
+namespace local_enrolconditions\condition;
 
-defined('MOODLE_INTERNAL') || die();
-
-global $CFG;
-require_once($CFG->libdir . '/formslib.php');
-
+use enrolcond_courseenrolled\condition;
+use local_enrolconditions\tree;
 /**
  * Tests of the enrolled in a course condition.
  *
- * @package    enrolcond_courseenrolled
+ * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 #[\PHPUnit\Framework\Attributes\CoversClass(condition::class)]
-final class condition_test extends \advanced_testcase {
+final class courseenrolled_test extends \advanced_testcase {
+    #[\Override]
+    public static function setUpBeforeClass(): void {
+        global $CFG;
+        require_once($CFG->libdir . '/formslib.php');
+        parent::setUpBeforeClass();
+    }
+
     public function test_any_and_all(): void {
         $this->resetAfterTest();
         $gen = $this->getDataGenerator();
@@ -51,7 +55,6 @@ final class condition_test extends \advanced_testcase {
         $this->assertFalse($condition->is_met((int) $none->id, $instance, $any));
         $this->assertTrue($condition->is_met((int) $both->id, $instance, $all));
         $this->assertFalse($condition->is_met((int) $one->id, $instance, $all));
-        $this->assertFalse($condition->is_met((int) $both->id, $instance, []));
     }
 
     public function test_active_enrolments(): void {
@@ -81,7 +84,7 @@ final class condition_test extends \advanced_testcase {
         $this->assertFalse($condition->is_met((int) $suspended->id, new \stdClass(), ['courseids' => [$course->id]]));
     }
 
-    public function test_own_instance_and_deleted_course(): void {
+    public function test_own_instance_and_all_mode(): void {
         global $DB;
         $this->resetAfterTest();
         $gen = $this->getDataGenerator();
@@ -100,9 +103,81 @@ final class condition_test extends \advanced_testcase {
         $gen->enrol_user($user->id, $other->id);
         $config = ['courseids' => [$course->id, $other->id], 'mode' => 'all'];
         $this->assertTrue($condition->is_met((int) $user->id, new \stdClass(), $config));
-        delete_course($other, false);
-        $this->assertFalse($condition->is_met((int) $user->id, new \stdClass(), $config));
-        $this->assertTrue($condition->is_met((int) $user->id, new \stdClass(), ['mode' => 'any'] + $config));
+        // Control: one enrolment of the two is not enough in "all" mode, and is in "any" mode.
+        $this->assertTrue($condition->is_met((int) $user->id, $manual, ['mode' => 'any'] + $config));
+        $this->assertFalse($condition->is_met((int) $user->id, $manual, $config));
+    }
+
+    /**
+     * Value of a tree with one enrolled in a course condition for a user, through the tree.
+     *
+     * @param array $config
+     * @param int $userid
+     * @param bool $negate
+     * @return bool|null Null when unknown; the debugging message of the failed condition is consumed.
+     */
+    protected function tree_value(array $config, int $userid, bool $negate = false): ?bool {
+        $root = ['op' => 'and', 'children' => [['type' => 'courseenrolled', 'negate' => $negate, 'config' => $config]]];
+        $value = tree::from_array($root)->evaluate($userid, (object) ['id' => 0, 'courseid' => SITEID])->get_value();
+        if ($value === null) {
+            $this->assertDebuggingCalled();
+        }
+        return $value;
+    }
+
+    /**
+     * Deleted courses, in both modes: any missing course makes the condition unknown.
+     */
+    public function test_deleted_course_is_unknown_not_unmet(): void {
+        $this->resetAfterTest();
+        $gen = $this->getDataGenerator();
+        $kept = $gen->create_course();
+        $gone = $gen->create_course();
+        $user = $gen->create_user();
+        $stranger = $gen->create_user();
+        $gen->enrol_user($user->id, $kept->id);
+        $gen->enrol_user($user->id, $gone->id);
+        $any = ['courseids' => [(int) $kept->id, (int) $gone->id], 'mode' => 'any'];
+        $all = ['mode' => 'all'] + $any;
+
+        // Control: with both courses there, every mode and negation answers true or false.
+        $this->assertTrue($this->tree_value($any, (int) $user->id));
+        $this->assertTrue($this->tree_value($all, (int) $user->id));
+        $this->assertFalse($this->tree_value($all, (int) $user->id, true));
+        $this->assertFalse($this->tree_value($any, (int) $stranger->id));
+        $this->assertTrue($this->tree_value($any, (int) $stranger->id, true));
+
+        delete_course($gone, false);
+        condition::reset_existence_cache();
+        foreach ([$any, $all] as $config) {
+            // Even the user enrolled in the course that is left, and even one enrolled in none.
+            $this->assertNull($this->tree_value($config, (int) $user->id));
+            $this->assertNull($this->tree_value($config, (int) $user->id, true));
+            $this->assertNull($this->tree_value($config, (int) $stranger->id));
+            $this->assertNull($this->tree_value($config, (int) $stranger->id, true));
+        }
+        try {
+            (new condition())->is_met((int) $user->id, new \stdClass(), $any);
+            $this->fail('A deleted course cannot be evaluated');
+        } catch (\moodle_exception $e) {
+            $this->assertSame('missingcourse', $e->errorcode);
+        }
+    }
+
+    public function test_course_ids_empty_from_another_site_are_unknown(): void {
+        $this->resetAfterTest();
+        $user = $this->getDataGenerator()->create_user();
+        $course = $this->getDataGenerator()->create_course();
+        $restored = (new condition())->restore_config(['courseids' => [(int) $course->id], 'mode' => 'any'], false);
+        $this->assertSame([], $restored['courseids']);
+
+        $this->assertNull($this->tree_value($restored, (int) $user->id));
+        $this->assertNull($this->tree_value($restored, (int) $user->id, true));
+        $this->assertNull($this->tree_value(['courseids' => [0]], (int) $user->id));
+        $this->assertNull($this->tree_value([], (int) $user->id));
+        // Control: the same site keeps the ids, which evaluate.
+        $kept = (new condition())->restore_config(['courseids' => [(int) $course->id]], true);
+        $this->assertFalse($this->tree_value($kept, (int) $user->id));
     }
 
     public function test_description(): void {
@@ -167,5 +242,28 @@ final class condition_test extends \advanced_testcase {
         $observed = array_filter($events, fn($e) => in_array(get_class($e), $condition->get_observed_events(), true));
         $this->assertCount(1, $observed);
         $this->assertEquals($user->id, reset($observed)->relateduserid);
+    }
+
+    public function test_check_access_needs_every_course_visible(): void {
+        $this->resetAfterTest();
+        $generator = $this->getDataGenerator();
+        $course = $generator->create_course();
+        $context = \context_course::instance($course->id);
+        $teacher = $generator->create_and_enrol($course, 'editingteacher');
+        $hidden = $generator->create_course(['visible' => 0]);
+        $visible = $generator->create_course();
+        $condition = new condition();
+
+        $this->setUser($teacher);
+        $this->assertSame(
+            get_string('noaccess', 'enrolcond_courseenrolled'),
+            $condition->check_access(['courseids' => [$visible->id, $hidden->id]], $context)
+        );
+        // Control: the visible course alone.
+        $this->assertNull($condition->check_access(['courseids' => [$visible->id]], $context));
+    }
+
+    public function test_privacy_is_compliant(): void {
+        $this->assertTrue((new \core_privacy\manager())->component_is_compliant('enrolcond_courseenrolled'));
     }
 }

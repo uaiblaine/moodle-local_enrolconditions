@@ -85,7 +85,12 @@ class enforcement_form {
             $mform->createElement('static', 'checkmodeenrol', '', get_string('checkmodeenrol', 'local_enrolconditions')),
         ];
         foreach (array_keys(self::CHECK_MODE_FIELDS) as $name) {
-            $elements[] = $mform->createElement('advcheckbox', $name, '', get_string($name, 'local_enrolconditions'));
+            $label = match ($name) {
+                'checkmodelogin' => get_string('checkmodelogin', 'local_enrolconditions'),
+                'checkmodeperiodic' => get_string('checkmodeperiodic', 'local_enrolconditions'),
+                'checkmodeevents' => get_string('checkmodeevents', 'local_enrolconditions'),
+            };
+            $elements[] = $mform->createElement('advcheckbox', $name, '', $label);
         }
         $mform->addGroup(
             $elements,

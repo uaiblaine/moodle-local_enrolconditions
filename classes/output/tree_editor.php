@@ -20,6 +20,7 @@ use context;
 use core\output\renderable;
 use core\output\renderer_base;
 use core\output\templatable;
+use local_enrolconditions\condition\editor_access;
 use local_enrolconditions\condition\manager;
 use local_enrolconditions\tree;
 use MoodleQuickForm;
@@ -35,12 +36,19 @@ class tree_editor implements renderable, templatable {
     /** @var string Id of the editor container. */
     protected string $uniqid;
 
+    /** @var bool[] Keys of the condition nodes stored in the instance ({@see editor_access::get_node_keys()}). */
+    protected array $storedkeys;
+
     /**
      * Constructor.
      *
      * @param tree $tree Tree being edited.
      * @param string $fieldname Name of the hidden form field that receives the JSON.
      * @param context $context Course context, checked by the condition forms.
+     * @param tree|null $stored Tree stored in the instance; null when nothing is stored, so every node of $tree is
+     *     shown only when the current user may reference it.
+     * @param string $enrol Enrolment method of the form, sent to the condition dialog; '' when unknown.
+     * @param int $instanceid Enrolment instance being edited, sent to the condition dialog; 0 for a new one.
      */
     public function __construct(
         /** @var tree Tree being edited. */
@@ -49,8 +57,14 @@ class tree_editor implements renderable, templatable {
         protected string $fieldname,
         /** @var context Course context. */
         protected context $context,
+        ?tree $stored = null,
+        /** @var string Enrolment method of the form. */
+        protected string $enrol = '',
+        /** @var int Enrolment instance being edited. */
+        protected int $instanceid = 0,
     ) {
-        $this->uniqid = \html_writer::random_id('local_enrolconditions_editor');
+        $this->uniqid = 'local_enrolconditions_editor_' . random_string(12);
+        $this->storedkeys = $stored ? editor_access::get_node_keys($stored->to_array()) : [];
     }
 
     /**
@@ -69,13 +83,19 @@ class tree_editor implements renderable, templatable {
      * Without JavaScript the editor shows a message and the field keeps its value.
      *
      * When the form comes back with validation errors, the editor shows the tree that was submitted, so
-     * the changes are not lost; if that tree is not valid, it shows the saved one.
+     * the changes are not lost; if that tree is not valid, it shows the saved one. A submitted node that is not
+     * stored in the instance shows its summary only when the current user may reference what it names.
+     *
+     * Pass the method name and the instance id: the condition dialog asks the method's config capability and
+     * recognises the stored nodes from them.
      *
      * @param MoodleQuickForm $mform
      * @param string $fieldname Name of the hidden field.
      * @param string $label Label shown next to the editor.
      * @param context $context Course context.
-     * @param string|null $json Saved value.
+     * @param string|null $json Saved value, as the instance stores it.
+     * @param string $enrol Enrolment method name (enrol_plugin::get_name()); '' when unknown.
+     * @param int $instanceid Enrolment instance being edited; 0 for a new one.
      */
     public static function add_to_form(
         MoodleQuickForm $mform,
@@ -83,6 +103,8 @@ class tree_editor implements renderable, templatable {
         string $label,
         context $context,
         ?string $json,
+        string $enrol = '',
+        int $instanceid = 0,
     ): void {
         global $OUTPUT, $PAGE;
 
@@ -100,7 +122,12 @@ class tree_editor implements renderable, templatable {
                 continue;
             }
         }
-        $editor = new self($tree, $fieldname, $context);
+        try {
+            $stored = tree::from_json($json);
+        } catch (\local_enrolconditions\invalid_tree_exception $e) {
+            $stored = null;
+        }
+        $editor = new self($tree, $fieldname, $context, $stored, $enrol, $instanceid);
         $mform->addElement('hidden', $fieldname);
         $mform->setType($fieldname, PARAM_NOTAGS);
         $mform->addElement('static', $fieldname . '_editor', $label, $OUTPUT->render($editor));
@@ -126,6 +153,8 @@ class tree_editor implements renderable, templatable {
         $config = [
             'fieldname' => $this->fieldname,
             'contextid' => $this->context->id,
+            'enrol' => $this->enrol,
+            'instanceid' => $this->instanceid,
             'maxdepth' => tree::MAX_DEPTH,
             'types' => $types,
             'tree' => $this->with_summaries($this->tree->to_array()),
@@ -139,6 +168,9 @@ class tree_editor implements renderable, templatable {
     /**
      * Adds the name and the summary of each condition, for display only.
      *
+     * The summary names what the condition refers to, so a node the current user may not reference and that is
+     * not stored in the instance (a submitted tree comes from the client) gets a generic text instead.
+     *
      * @param array $node
      * @return array
      */
@@ -146,8 +178,13 @@ class tree_editor implements renderable, templatable {
         if (isset($node['type'])) {
             $condition = manager::get_condition($node['type']);
             $node['name'] = $condition ? $condition->get_name() : $node['type'];
-            $node['summary'] = $condition ? $condition->get_summary($node['config'])
-                : get_string('editorunknowntype', 'local_enrolconditions', $node['type']);
+            if (!$condition) {
+                $node['summary'] = get_string('editorunknowntype', 'local_enrolconditions', $node['type']);
+            } else if (editor_access::check_node($node['type'], $node['config'], $this->context, $this->storedkeys) !== null) {
+                $node['summary'] = get_string('editornotavailable', 'local_enrolconditions');
+            } else {
+                $node['summary'] = $condition->get_summary($node['config']);
+            }
             $node['known'] = (bool) $condition;
             return $node;
         }

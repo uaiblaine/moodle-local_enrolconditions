@@ -17,6 +17,7 @@
 namespace enrolcond_userfile\task;
 
 use enrolcond_userfile\condition;
+use local_enrolconditions\condition\manager;
 
 /**
  * Deletes files of usernames that no condition refers to any more.
@@ -35,26 +36,38 @@ class cleanup_files extends \core\task\scheduled_task {
     }
 
     /**
-     * File ids referred to by the condition trees of the enrolment methods of a course.
+     * File ids referred to by the stored condition trees of the enrolment instances of a course.
+     *
+     * Every method that stores condition trees counts, enabled or not, read through its own API
+     * (\local_enrolconditions\enforceable::get_enforcement_tree()), so no method's files are deleted.
      *
      * @param int $courseid
      * @return bool[] Keys are the file ids.
      */
     public static function get_referenced_fileids(int $courseid): array {
-        global $DB;
         $ids = [];
-        $trees = $DB->get_fieldset_select('enrol', 'customtext2', 'courseid = ? AND enrol = ?', [$courseid, 'conditional']);
-        foreach ($trees as $json) {
-            $tree = json_decode((string) $json, true);
-            if (is_array($tree)) {
-                array_walk_recursive($tree, function ($value, $key) use (&$ids): void {
-                    if ($key === 'fileid') {
-                        $ids[(int) $value] = true;
-                    }
-                });
-            }
+        foreach (manager::get_course_trees($courseid) as $tree) {
+            self::collect_fileids($tree->to_array(), $ids);
         }
         return $ids;
+    }
+
+    /**
+     * Adds the file ids of the userfile conditions of a node and its children.
+     *
+     * @param array $node
+     * @param array $ids Receives the file ids as keys.
+     */
+    protected static function collect_fileids(array $node, array &$ids): void {
+        if (isset($node['type'])) {
+            if ($node['type'] === 'userfile' && (int) ($node['config']['fileid'] ?? 0) > 0) {
+                $ids[(int) $node['config']['fileid']] = true;
+            }
+            return;
+        }
+        foreach ($node['children'] ?? [] as $child) {
+            self::collect_fileids((array) $child, $ids);
+        }
     }
 
     #[\Override]

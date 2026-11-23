@@ -30,6 +30,8 @@ require_once($CFG->dirroot . '/enrol/manual/lib.php');
 /**
  * Manual enrolment method that keeps a condition tree in customtext1, the check modes in customint7 and the action
  * in customint8 (plus 16 to reactivate). It lets the enforcer select instances by loading them (no mode SQL).
+ * customchar1 'throw' makes get_enforcement_action() throw, 'throwtree' makes get_enforcement_tree() throw an
+ * \Error, for the tests of the error paths.
  *
  * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
@@ -43,6 +45,9 @@ class local_enrolconditions_fake_enforceable extends enrol_manual_plugin impleme
 
     #[\Override]
     public function get_enforcement_tree(stdClass $instance): ?string {
+        if (($instance->customchar1 ?? '') === 'throwtree') {
+            throw new \TypeError('Broken enrolment method');
+        }
         return $instance->customtext1 ?? null;
     }
 
@@ -53,6 +58,9 @@ class local_enrolconditions_fake_enforceable extends enrol_manual_plugin impleme
 
     #[\Override]
     public function get_enforcement_action(stdClass $instance): int {
+        if (($instance->customchar1 ?? '') === 'throw') {
+            throw new \moodle_exception('error');
+        }
         return (int) $instance->customint8 & 15;
     }
 

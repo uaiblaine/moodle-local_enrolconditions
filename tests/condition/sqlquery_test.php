@@ -14,26 +14,30 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <https://www.gnu.org/licenses/>.
 
-namespace enrolcond_sqlquery;
+namespace local_enrolconditions\condition;
 
+use enrolcond_sqlquery\condition;
 use enrolcond_sqlquery\local\queries;
-
-defined('MOODLE_INTERNAL') || die();
-
-global $CFG;
-require_once($CFG->libdir . '/formslib.php');
 
 /**
  * Tests of the list from a query condition.
  *
- * @package    enrolcond_sqlquery
+ * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 #[\PHPUnit\Framework\Attributes\CoversClass(condition::class)]
 #[\PHPUnit\Framework\Attributes\CoversClass(queries::class)]
-#[\PHPUnit\Framework\Attributes\CoversClass(admin\setting_query::class)]
-final class condition_test extends \advanced_testcase {
+#[\PHPUnit\Framework\Attributes\CoversClass(\enrolcond_sqlquery\admin\setting_query::class)]
+final class sqlquery_test extends \advanced_testcase {
+    #[\Override]
+    public static function setUpBeforeClass(): void {
+        global $CFG;
+        require_once($CFG->libdir . '/formslib.php');
+        require_once(__DIR__ . '/../fixtures/counting_refusing_lock_factory.php');
+        parent::setUpBeforeClass();
+    }
+
     #[\Override]
     protected function setUp(): void {
         parent::setUp();
@@ -56,6 +60,13 @@ final class condition_test extends \advanced_testcase {
             $this->assertSame('errortransaction', $e->errorcode);
         }
         $transaction->allow_commit();
+    }
+
+    /**
+     * Forgets the results kept in this request only, as a new request would; the shared cache stays.
+     */
+    protected function forget_request(): void {
+        (new \ReflectionProperty(queries::class, 'results'))->setValue(null, []);
     }
 
     /**
@@ -142,6 +153,75 @@ final class condition_test extends \advanced_testcase {
         $this->assertFalse($condition->is_met((int) $user->id, $instance, ['query' => '1']));
     }
 
+    public function test_cache_key_is_per_course_only_with_courseid(): void {
+        global $DB;
+        $first = $this->getDataGenerator()->create_course();
+        $second = $this->getDataGenerator()->create_course();
+        $user = $this->getDataGenerator()->create_user();
+        set_config('cachettl', HOURSECS, queries::COMPONENT);
+        $this->define(1, 'Late', "SELECT username FROM {user} WHERE city = 'Late'");
+        $this->define(2, 'Course', "SELECT username FROM {user} WHERE city = 'Late' AND :courseid > 0");
+        $condition = new condition();
+
+        $this->assertFalse($condition->is_met((int) $user->id, (object) ['courseid' => $first->id], ['query' => '1']));
+        $this->assertFalse($condition->is_met((int) $user->id, (object) ['courseid' => $first->id], ['query' => '2']));
+        $DB->set_field('user', 'city', 'Late', ['id' => $user->id]);
+        $this->forget_request();
+
+        // Without :courseid the list of the first course is the list of every course: stored once.
+        $this->assertFalse($condition->is_met((int) $user->id, (object) ['courseid' => $second->id], ['query' => '1']));
+        // Control: with :courseid each course has its own entry, so the second course runs the query.
+        $this->assertTrue($condition->is_met((int) $user->id, (object) ['courseid' => $second->id], ['query' => '2']));
+        $this->assertSame(
+            sha1("SELECT username FROM {user} WHERE city = 'Late'"),
+            queries::cache_key("SELECT username FROM {user} WHERE city = 'Late'", (int) $second->id)
+        );
+    }
+
+    public function test_expired_entry_is_refreshed_by_one_request(): void {
+        global $CFG, $DB;
+        $course = $this->getDataGenerator()->create_course();
+        $user = $this->getDataGenerator()->create_user();
+        $sql = "SELECT username FROM {user} WHERE city = 'Late'";
+        set_config('cachettl', MINSECS, queries::COMPONENT);
+        $this->define(1, 'Late', $sql);
+        $condition = new condition();
+        $instance = (object) ['courseid' => $course->id];
+        $cache = \cache::make(queries::COMPONENT, 'results');
+        $key = queries::cache_key($sql, (int) $course->id);
+
+        $this->assertFalse($condition->is_met((int) $user->id, $instance, ['query' => '1']));
+        $DB->set_field('user', 'city', 'Late', ['id' => $user->id]);
+        $expire = function () use ($cache, $key): void {
+            $entry = $cache->get($key);
+            $entry['time'] -= 2 * MINSECS;
+            $cache->set($key, $entry);
+            $this->forget_request();
+        };
+
+        // Another node holds the refresh lock: the expired entry is served and the query does not run.
+        $expire();
+        $CFG->lock_factory = '\\local_enrolconditions\\counting_refusing_lock_factory';
+        \local_enrolconditions\counting_refusing_lock_factory::$asked = 0;
+        $this->assertFalse($condition->is_met((int) $user->id, $instance, ['query' => '1']));
+        $this->assertSame(1, \local_enrolconditions\counting_refusing_lock_factory::$asked);
+
+        // Nothing to serve and the lock still held: unknown, not a stampede of queries.
+        $cache->delete($key);
+        $this->forget_request();
+        try {
+            $condition->is_met((int) $user->id, $instance, ['query' => '1']);
+            $this->fail('errorbusy expected');
+        } catch (\moodle_exception $e) {
+            $this->assertSame('errorbusy', $e->errorcode);
+        }
+
+        // Control: with the lock free, this request refreshes the entry.
+        $CFG->lock_factory = 'auto';
+        $this->assertTrue($condition->is_met((int) $user->id, $instance, ['query' => '1']));
+        $this->assertArrayHasKey(\core_text::strtolower($user->username), $cache->get($key)['usernames']);
+    }
+
     public function test_missing_or_failing_query_is_unknown(): void {
         global $CFG;
         require_once($CFG->dirroot . '/local/enrolconditions/tests/fixtures/fake_condition.php');
@@ -166,7 +246,7 @@ final class condition_test extends \advanced_testcase {
     }
 
     public function test_setting_validation(): void {
-        $setting = new admin\setting_query('enrolcond_sqlquery/query1sql', 'Query', '');
+        $setting = new \enrolcond_sqlquery\admin\setting_query('enrolcond_sqlquery/query1sql', 'Query', '');
         $this->assertTrue($setting->validate(''));
         $this->assertTrue($setting->validate('SELECT username FROM {user} WHERE id = :courseid'));
         $this->assertSame(get_string('errorselect', queries::COMPONENT), $setting->validate('DELETE FROM {user}'));
@@ -186,5 +266,9 @@ final class condition_test extends \advanced_testcase {
         $this->assertTrue($form->elementExists('query'));
         $this->assertFalse($form->elementExists('noqueries'));
         $this->assertSame(['query' => '3'], (new condition())->config_from_form_data((object) ['query' => 3]));
+    }
+
+    public function test_privacy_is_compliant(): void {
+        $this->assertTrue((new \core_privacy\manager())->component_is_compliant('enrolcond_sqlquery'));
     }
 }

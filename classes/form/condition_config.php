@@ -19,15 +19,22 @@ namespace local_enrolconditions\form;
 use context;
 use core\url;
 use local_enrolconditions\condition\base;
+use local_enrolconditions\condition\editor_access;
 use local_enrolconditions\condition\manager;
 use local_enrolconditions\tree;
 use moodle_exception;
+use stdClass;
 
 /**
  * Modal form that edits the configuration of one condition of a tree.
  *
- * It does not save anything: it returns the configuration (JSON) and its summary to the tree editor,
- * which keeps them in the field of the enrolment method form.
+ * It does not save anything in the instance: it returns the configuration (JSON) and its summary to the tree
+ * editor, which keeps them in the field of the enrolment method form. A condition may store data of its own on
+ * submission (the file of enrolcond_userfile).
+ *
+ * The configuration posted by the editor (FIELD_CONFIG) is the client's: it only pre-fills the form when it is
+ * a node already stored in the instance or one the user may reference, and the returned configuration passes
+ * editor_access::check_node() before its summary is built.
  *
  * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
@@ -42,6 +49,15 @@ class condition_config extends \core_form\dynamic_form {
 
     /** @var string Name of the hidden field with the current configuration (JSON). */
     protected const FIELD_CONFIG = 'enrolcondconfig';
+
+    /** @var string Name of the hidden field with the enrolment method of the instance form. */
+    protected const FIELD_ENROL = 'enrolcondenrol';
+
+    /** @var string Name of the hidden field with the enrolment instance being edited (0 for a new one). */
+    protected const FIELD_INSTANCE = 'enrolcondinstanceid';
+
+    /** @var stdClass|null|false Instance being edited; false until loaded. */
+    protected $instance = false;
 
     /**
      * Condition being edited.
@@ -77,11 +93,45 @@ class condition_config extends \core_form\dynamic_form {
 
     #[\Override]
     protected function check_access_for_dynamic_submission(): void {
-        $context = $this->get_context_for_dynamic_submission();
-        if ($context->contextlevel !== CONTEXT_COURSE) {
-            throw new moodle_exception('invalidcontext');
+        $this->instance = editor_access::require_editor_access(
+            $this->get_context_for_dynamic_submission(),
+            $this->optional_param(self::FIELD_ENROL, '', PARAM_ALPHANUMEXT),
+            $this->optional_param(self::FIELD_INSTANCE, 0, PARAM_INT)
+        );
+        // New and changed conditions must be of an enabled type; the editor offers no other.
+        $type = $this->optional_param(self::FIELD_TYPE, '', PARAM_ALPHANUMEXT);
+        if (!manager::is_enabled($type)) {
+            throw new moodle_exception('treeunknowntype', 'local_enrolconditions', '', $type);
         }
-        require_capability('moodle/course:enrolconfig', $context);
+    }
+
+    /**
+     * Keys of the condition nodes stored in the instance being edited.
+     *
+     * @return bool[] editor_access::get_node_keys() of the stored tree; empty for a new instance.
+     */
+    protected function get_stored_keys(): array {
+        if ($this->instance === false) {
+            $this->check_access_for_dynamic_submission();
+        }
+        $tree = $this->instance ? manager::get_instance_tree($this->instance) : null;
+        return $tree ? editor_access::get_node_keys($tree->to_array()) : [];
+    }
+
+    /**
+     * Error of a configuration the current user may not reference.
+     *
+     * @param base $condition
+     * @param array $config
+     * @return string|null
+     */
+    protected function check_node(base $condition, array $config): ?string {
+        return editor_access::check_node(
+            $condition->get_type(),
+            $config,
+            $this->get_context_for_dynamic_submission(),
+            $this->get_stored_keys()
+        );
     }
 
     #[\Override]
@@ -93,6 +143,12 @@ class condition_config extends \core_form\dynamic_form {
         $mform->setType(self::FIELD_TYPE, PARAM_ALPHANUMEXT);
         $mform->addElement('hidden', self::FIELD_CONFIG);
         $mform->setType(self::FIELD_CONFIG, PARAM_NOTAGS);
+        $mform->addElement('hidden', self::FIELD_ENROL);
+        $mform->setType(self::FIELD_ENROL, PARAM_ALPHANUMEXT);
+        $mform->addElement('hidden', self::FIELD_INSTANCE);
+        $mform->setType(self::FIELD_INSTANCE, PARAM_INT);
+        // Shows the error of a configuration the user may not reference; empty otherwise.
+        $mform->addElement('static', 'enrolcondaccess', '');
 
         $this->get_condition()->config_form_definition($mform);
     }
@@ -100,17 +156,31 @@ class condition_config extends \core_form\dynamic_form {
     #[\Override]
     public function validation($data, $files): array {
         $errors = parent::validation($data, $files);
-        return array_merge($errors, $this->get_condition()->config_form_validation($data, $files));
+        $condition = $this->get_condition();
+        $errors = array_merge($errors, $condition->config_form_validation($data, $files));
+        if (!$errors) {
+            $error = $this->check_node($condition, $condition->config_from_form_data((object) $data));
+            if ($error !== null) {
+                $errors['enrolcondaccess'] = $error;
+            }
+        }
+        return $errors;
     }
 
     #[\Override]
     public function set_data_for_dynamic_submission(): void {
         $condition = $this->get_condition();
         $config = $this->get_current_config();
+        if ($config && ($condition->validate_config($config) || $this->check_node($condition, $config) !== null)) {
+            // The form would show the names of what the posted configuration refers to: start empty instead.
+            $config = [];
+        }
         $data = $condition->config_to_form_data_in_context($config, $this->get_context_for_dynamic_submission());
         $data[self::FIELD_CONTEXT] = $this->get_context_for_dynamic_submission()->id;
         $data[self::FIELD_TYPE] = $condition->get_type();
         $data[self::FIELD_CONFIG] = json_encode($config, tree::JSON_FLAGS);
+        $data[self::FIELD_ENROL] = $this->optional_param(self::FIELD_ENROL, '', PARAM_ALPHANUMEXT);
+        $data[self::FIELD_INSTANCE] = $this->optional_param(self::FIELD_INSTANCE, 0, PARAM_INT);
         $this->set_data($data);
     }
 
@@ -123,6 +193,11 @@ class condition_config extends \core_form\dynamic_form {
             $data,
             $this->get_context_for_dynamic_submission()
         );
+        // The summary names what the configuration refers to: check the final configuration, not only the form's.
+        $error = $this->check_node($condition, $config);
+        if ($error !== null) {
+            throw new moodle_exception('editornotavailable', 'local_enrolconditions');
+        }
         return [
             'config' => json_encode($config, tree::JSON_FLAGS),
             'summary' => $condition->get_summary($config),

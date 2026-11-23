@@ -14,22 +14,27 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <https://www.gnu.org/licenses/>.
 
-namespace enrolcond_profile;
+namespace local_enrolconditions\condition;
 
-defined('MOODLE_INTERNAL') || die();
-
-global $CFG;
-require_once($CFG->libdir . '/formslib.php');
+use enrolcond_profile\condition;
+use local_enrolconditions\tree;
 
 /**
  * Tests of the user profile condition.
  *
- * @package    enrolcond_profile
+ * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 #[\PHPUnit\Framework\Attributes\CoversClass(condition::class)]
-final class condition_test extends \advanced_testcase {
+final class profile_test extends \advanced_testcase {
+    #[\Override]
+    public static function setUpBeforeClass(): void {
+        global $CFG;
+        require_once($CFG->libdir . '/formslib.php');
+        parent::setUpBeforeClass();
+    }
+
     /**
      * Cases of is_met for a user with email "Ana.Silva@IFRN.edu.br" and an empty department.
      *
@@ -52,8 +57,6 @@ final class condition_test extends \advanced_testcase {
             'is not empty' => ['email', 'isnotempty', '', true],
             'is not empty, empty' => ['department', 'isnotempty', '', false],
             'unknown operator' => ['email', 'xor', 'x', false],
-            'field not allowed' => ['password', 'isnotempty', '', false],
-            'unknown custom field' => ['profile_field_missing', 'isempty', '', false],
         ];
     }
 
@@ -92,6 +95,67 @@ final class condition_test extends \advanced_testcase {
         $this->assertArrayHasKey('profile_field_campus', $condition->get_fields());
         $this->assertSame([], $condition->validate_config($config));
         $this->assertSame('Your Campus name is "Natal"', $condition->get_description($config, false));
+    }
+
+    /**
+     * Value of a tree with one profile condition for a user, through the tree.
+     *
+     * @param array $config
+     * @param int $userid
+     * @param bool $negate
+     * @return bool|null Null when unknown; the debugging message of the failed condition is consumed.
+     */
+    protected function tree_value(array $config, int $userid, bool $negate = false): ?bool {
+        $root = ['op' => 'and', 'children' => [['type' => 'profile', 'negate' => $negate, 'config' => $config]]];
+        $value = tree::from_array($root)->evaluate($userid, (object) ['id' => 0, 'courseid' => SITEID])->get_value();
+        if ($value === null) {
+            $this->assertDebuggingCalled();
+        }
+        return $value;
+    }
+
+    public function test_deleted_custom_field_is_unknown_not_unmet(): void {
+        global $CFG;
+        $this->resetAfterTest();
+        $this->getDataGenerator()->create_custom_profile_field(['datatype' => 'text', 'shortname' => 'campus', 'name' => 'Campus']);
+        $user = $this->getDataGenerator()->create_user(['profile_field_campus' => 'Natal']);
+        $config = ['field' => 'profile_field_campus', 'operator' => 'isequalto', 'value' => 'natal'];
+
+        // Control: while the field exists the answer is true or false, negated or not.
+        $this->assertTrue($this->tree_value($config, (int) $user->id));
+        $this->assertFalse($this->tree_value($config, (int) $user->id, true));
+        $this->assertFalse($this->tree_value(['value' => 'mossoró'] + $config, (int) $user->id));
+
+        // Whatever the operator, a deleted field is unknown: "is empty" and "does not contain" are no exception.
+        require_once($CFG->dirroot . '/user/profile/definelib.php');
+        $field = $this->getDataGenerator()->create_custom_profile_field([
+            'datatype' => 'text', 'shortname' => 'old', 'name' => 'Old',
+        ]);
+        $oldconfig = ['field' => 'profile_field_old', 'operator' => 'isempty', 'value' => ''];
+        $this->assertTrue($this->tree_value($oldconfig, (int) $user->id));
+        profile_delete_field($field->id);
+        $this->assertNull($this->tree_value($oldconfig, (int) $user->id));
+        $this->assertNull($this->tree_value($oldconfig, (int) $user->id, true));
+        $this->assertNull($this->tree_value(['operator' => 'doesnotcontain', 'value' => 'x'] + $oldconfig, (int) $user->id, true));
+        try {
+            (new condition())->is_met((int) $user->id, new \stdClass(), $oldconfig);
+            $this->fail('A deleted field cannot be evaluated');
+        } catch (\moodle_exception $e) {
+            $this->assertSame('missingfield', $e->errorcode);
+        }
+    }
+
+    public function test_field_outside_the_allowed_list_is_unknown(): void {
+        $this->resetAfterTest();
+        $user = $this->getDataGenerator()->create_user(['email' => 'ana@example.com']);
+        $config = ['field' => 'password', 'operator' => 'isnotempty', 'value' => ''];
+        $this->assertNull($this->tree_value($config, (int) $user->id));
+        $this->assertNull($this->tree_value($config, (int) $user->id, true));
+        $this->assertNull($this->tree_value(['field' => ''] + $config, (int) $user->id));
+        $this->assertNull($this->tree_value([], (int) $user->id));
+        // Control: a field of the list evaluates.
+        $this->assertTrue($this->tree_value(['field' => 'email'] + $config, (int) $user->id));
+        $this->assertFalse($this->tree_value(['field' => 'email'] + $config, (int) $user->id, true));
     }
 
     public function test_description_is_escaped(): void {
@@ -136,5 +200,9 @@ final class condition_test extends \advanced_testcase {
         $this->assertTrue($form->elementExists('value'));
         $this->assertSame([\core\event\user_updated::class], $condition->get_observed_events());
         $this->assertSame('profile', $condition->get_type());
+    }
+
+    public function test_privacy_is_compliant(): void {
+        $this->assertTrue((new \core_privacy\manager())->component_is_compliant('enrolcond_profile'));
     }
 }

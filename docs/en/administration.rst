@@ -48,14 +48,21 @@ Example, the users with a given institution:
 Re-checks
 ---------
 
-The enrolment methods that use this engine (``enrol_conditional`` and any other that implements ``\local_enrolconditions\enforceable``) choose, per instance, when existing enrolments are re-checked and what happens when the conditions are no longer met. *Site administration > Plugins > Enrolments > Enrolment conditions > Re-checks* has the setting common to all of them:
+The enrolment methods that use this engine (``enrol_conditional`` and any other that implements ``\local_enrolconditions\enforceable``) choose, per instance, when existing enrolments are re-checked and what happens when the conditions are no longer met. *Site administration > Plugins > Enrolments > Enrolment conditions > Re-checks* has the settings common to all of them:
 
-Enrolments per periodic check
-   Maximum number of enrolments re-checked by each run of the scheduled task (default 500). The next run continues where the previous one stopped.
+Enrolments per chunk
+   Number of enrolments the scheduled task reads and re-checks at a time (default 500).
+
+Time limit of a periodic check
+   How long each run of the scheduled task keeps re-checking chunks (default one minute). A run always checks at least one chunk and stops earlier when it has gone through every enrolment; the next run continues where it stopped, on any server.
 
 Scheduled tasks
 ---------------
 
-*Re-check the conditions of existing enrolments* runs every hour and re-checks, in batches, the enrolments of the instances with the periodic check.
+*Re-check the conditions of existing enrolments* runs every hour and re-checks, chunk by chunk within its time limit, the enrolments of the instances with the periodic check.
+
+*Delete the condition records of enrolments that no longer exist* runs daily and removes the records of enrolments deleted without an event (for example, when an enrolment method is uninstalled).
+
+The re-checks on events run in the background: an event observed by the conditions queues an ad hoc task *Re-check the enrolments of a user after a change the conditions depend on*, which cron runs shortly after. Changes made by these tasks can queue further ones, at most five levels deep, so instances whose conditions depend on each other cannot keep changing each other.
 
 *Delete files of usernames no longer used by any condition* (``enrolcond_userfile``) runs daily and deletes, after one day, the files that no condition uses any more.

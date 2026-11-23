@@ -46,7 +46,7 @@ $observers = [
         'callback' => '\local_enrolconditions\observer::enrol_instance_deleted',
     ],
     [
-        // Re-check on the events observed by the conditions (check mode "events").
+        // Queues a re-check on the events observed by the conditions (check mode "events"); evaluates nothing.
         'eventname' => '*',
         'callback' => '\local_enrolconditions\observer::any_event',
     ],

@@ -16,20 +16,57 @@
 
 namespace enrolcond_userlist\privacy;
 
+use core_privacy\local\metadata\collection;
+use core_privacy\local\request\approved_contextlist;
+use core_privacy\local\request\approved_userlist;
+use core_privacy\local\request\contextlist;
+use core_privacy\local\request\userlist;
+
 /**
- * Privacy provider: this condition stores no personal data.
+ * Privacy provider: the usernames a teacher types are configuration data of the enrolment instance.
+ *
+ * The list is kept in the condition tree that the enrolment method stores in its instance (a column of the enrol
+ * table). It is declared here and, like the user lists of core_reportbuilder's audiences (configdata), it is
+ * neither exported nor erased per listed person: the tree belongs to the instance, and
+ * \local_enrolconditions\enforceable offers no way to rewrite it. The request methods therefore find nothing; the
+ * list goes with the instance when it is deleted.
  *
  * @package    enrolcond_userlist
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
-class provider implements \core_privacy\local\metadata\null_provider {
-    /**
-     * Identifier of the string that explains why no data is stored.
-     *
-     * @return string
-     */
-    public static function get_reason(): string {
-        return 'privacy:metadata';
+class provider implements
+    \core_privacy\local\metadata\provider,
+    \core_privacy\local\request\core_userlist_provider,
+    \core_privacy\local\request\plugin\provider {
+    #[\Override]
+    public static function get_metadata(collection $collection): collection {
+        $collection->add_database_table('enrol', ['usernames' => 'privacy:metadata:enrol:usernames'], 'privacy:metadata:enrol');
+        return $collection;
+    }
+
+    #[\Override]
+    public static function get_contexts_for_userid(int $userid): contextlist {
+        return new contextlist();
+    }
+
+    #[\Override]
+    public static function get_users_in_context(userlist $userlist): void {
+    }
+
+    #[\Override]
+    public static function export_user_data(approved_contextlist $contextlist): void {
+    }
+
+    #[\Override]
+    public static function delete_data_for_all_users_in_context(\context $context): void {
+    }
+
+    #[\Override]
+    public static function delete_data_for_user(approved_contextlist $contextlist): void {
+    }
+
+    #[\Override]
+    public static function delete_data_for_users(approved_userlist $userlist): void {
     }
 }

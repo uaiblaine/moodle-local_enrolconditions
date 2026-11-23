@@ -64,14 +64,15 @@ class condition extends \local_enrolconditions\condition\base {
      * @return string[]
      */
     public function get_operators(): array {
-        $operators = [];
-        foreach (
-            [self::OP_EQUALS, self::OP_CONTAINS, self::OP_NOT_CONTAINS, self::OP_STARTS, self::OP_ENDS,
-                self::OP_EMPTY, self::OP_NOT_EMPTY] as $operator
-        ) {
-            $operators[$operator] = get_string('op_' . $operator, 'enrolcond_profile');
-        }
-        return $operators;
+        return [
+            self::OP_EQUALS => get_string('op_isequalto', 'enrolcond_profile'),
+            self::OP_CONTAINS => get_string('op_contains', 'enrolcond_profile'),
+            self::OP_NOT_CONTAINS => get_string('op_doesnotcontain', 'enrolcond_profile'),
+            self::OP_STARTS => get_string('op_startswith', 'enrolcond_profile'),
+            self::OP_ENDS => get_string('op_endswith', 'enrolcond_profile'),
+            self::OP_EMPTY => get_string('op_isempty', 'enrolcond_profile'),
+            self::OP_NOT_EMPTY => get_string('op_isnotempty', 'enrolcond_profile'),
+        ];
     }
 
     /**
@@ -123,7 +124,9 @@ class condition extends \local_enrolconditions\condition\base {
     public function is_met(int $userid, stdClass $instance, array $config): bool {
         $value = $this->get_user_value($userid, (string) ($config['field'] ?? ''));
         if ($value === null) {
-            return false;
+            // A custom field that was deleted, or a name outside the allowed fields: the comparison has nothing
+            // to compare, so it is unknown rather than false (or "is empty" would be met for everybody).
+            throw new \moodle_exception('missingfield', 'enrolcond_profile');
         }
         $value = core_text::strtolower(trim($value));
         $expected = core_text::strtolower(trim((string) ($config['value'] ?? '')));
@@ -155,15 +158,21 @@ class condition extends \local_enrolconditions\condition\base {
             'field' => s($fields[$field] ?? $field),
             'value' => s((string) ($config['value'] ?? '')),
         ];
-        if (!array_key_exists($operator, $this->get_operators())) {
-            $operator = self::OP_EQUALS;
-        }
-        return get_string('desc_' . $operator, 'enrolcond_profile', $a);
+        return match ($operator) {
+            self::OP_CONTAINS => get_string('desc_contains', 'enrolcond_profile', $a),
+            self::OP_NOT_CONTAINS => get_string('desc_doesnotcontain', 'enrolcond_profile', $a),
+            self::OP_STARTS => get_string('desc_startswith', 'enrolcond_profile', $a),
+            self::OP_ENDS => get_string('desc_endswith', 'enrolcond_profile', $a),
+            self::OP_EMPTY => get_string('desc_isempty', 'enrolcond_profile', $a),
+            self::OP_NOT_EMPTY => get_string('desc_isnotempty', 'enrolcond_profile', $a),
+            default => get_string('desc_isequalto', 'enrolcond_profile', $a),
+        };
     }
 
     #[\Override]
     public function config_form_definition(MoodleQuickForm $mform): void {
         $mform->addElement('select', 'field', get_string('field', 'enrolcond_profile'), $this->get_fields());
+        $mform->addHelpButton('field', 'field', 'enrolcond_profile');
         $mform->addElement('select', 'operator', get_string('operator', 'enrolcond_profile'), $this->get_operators());
         $mform->addElement('text', 'value', get_string('value', 'enrolcond_profile'), ['size' => 40]);
         $mform->setType('value', PARAM_TEXT);
