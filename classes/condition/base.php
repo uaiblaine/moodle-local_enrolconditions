@@ -93,9 +93,12 @@ abstract class base {
      * each node that is not already stored unchanged ({@see editor_access::check_node()}). A node already stored
      * is never asked again, so a tree an administrator wrote stays editable by a teacher.
      *
-     * Override when the configuration names records whose visibility depends on the user.
+     * Override when the configuration names records whose visibility depends on the user. It runs before
+     * validate_config() for a node that is new or changed ({@see editor_access::validate_node()}), so it must cope
+     * with a configuration validation would refuse, and must answer a record that does not exist exactly as one the
+     * user may not reference: otherwise the two answers tell a user which ids exist.
      *
-     * @param array $config Configuration, already valid for validate_config().
+     * @param array $config Configuration, not validated yet.
      * @param \context $context Course context of the enrolment instance.
      * @return string|null Localised error when the user may not reference it; null when they may.
      */
@@ -168,21 +171,52 @@ abstract class base {
     /**
      * Whether the current user may name a course in a condition ({@see check_access()}).
      *
-     * Mirrors the rule of core's course form element (MoodleQuickForm_course::setValue()), the element that picks
-     * courses in the dialogs: the user is enrolled in the course or core_course_category::can_view_course_info()
-     * allows it. Keep the two in step.
+     * Mirrors the rule of core's course form element (MoodleQuickForm_course::setValue(), lib/form/course.php),
+     * the element that picks courses in the dialogs: core_course_category::can_view_course_info() allows it, or the
+     * course is one enrol_get_my_courses() lists, which is an active enrolment (the same test is_enrolled() makes
+     * with $onlyactive) in a course that is visible or where the user holds moodle/course:viewhiddencourses
+     * (lib/enrollib.php, the visibility loop at the end of enrol_get_my_courses()). Keep the three in step; the
+     * login-as restriction of enrol_get_my_courses() is not mirrored, since a user logged in as another cannot
+     * configure enrolment methods of other courses.
+     *
+     * The answer is kept for the request, per user and course ({@see records_exist()}'s request cache): a tree
+     * re-rendered by the editor may name the same courses in a hundred nodes.
      *
      * @param int $courseid
      * @return bool False as well when the course does not exist.
      */
     protected static function can_reference_course(int $courseid): bool {
+        global $USER;
+        $cache = self::existence_cache();
+        $key = 'reach_' . (int) $USER->id . '_' . $courseid;
+        $known = $cache->get($key);
+        if ($known === false) {
+            $known = self::decide_course_reach($courseid) ? 1 : 0;
+            $cache->set($key, $known);
+        }
+        return (bool) $known;
+    }
+
+    /**
+     * The rule of can_reference_course(), without the request cache.
+     *
+     * @param int $courseid
+     * @return bool
+     */
+    private static function decide_course_reach(int $courseid): bool {
         global $DB, $USER;
         $course = $courseid > 0 ? $DB->get_record('course', ['id' => $courseid], 'id, category, visible') : false;
         if (!$course) {
             return false;
         }
-        return \core_course_category::can_view_course_info($course)
-            || is_enrolled(\context_course::instance($courseid), $USER, '', true);
+        if (\core_course_category::can_view_course_info($course)) {
+            return true;
+        }
+        $context = \context_course::instance($courseid);
+        if (!$course->visible && !has_capability('moodle/course:viewhiddencourses', $context)) {
+            return false;
+        }
+        return is_enrolled($context, $USER, '', true);
     }
 
     /**
@@ -190,14 +224,19 @@ abstract class base {
      *
      * The periodic re-check evaluates one condition for every participant of an instance, so the existence
      * of the cohort, course or field it names is looked up once and kept in a request cache (never shared: a
-     * deletion is seen by the next request). Ids that are not positive do not exist.
+     * deletion is seen by the next request). Ids that are not positive do not exist, and neither does an empty
+     * list: a configuration that names no record (what a restore from another site leaves) is not one whose records
+     * exist, so callers do not test for it themselves and an empty list is never cached.
      *
      * @param string $table Table without prefix, with an id column.
      * @param int[] $ids
-     * @return bool False when any id is missing; true for an empty list.
+     * @return bool False for an empty list or when any id is missing; true when every id exists.
      */
     protected static function records_exist(string $table, array $ids): bool {
         global $DB;
+        if (!$ids) {
+            return false;
+        }
         $cache = self::existence_cache();
         $unknown = [];
         foreach (array_unique($ids) as $id) {
@@ -227,7 +266,8 @@ abstract class base {
     }
 
     /**
-     * Forgets what {@see records_exist()} knows, for code that deletes a record and evaluates in the same request.
+     * Forgets what {@see records_exist()} and {@see can_reference_course()} know, for code that deletes a record,
+     * or changes what a user may see, and decides again in the same request.
      */
     public static function reset_existence_cache(): void {
         self::existence_cache()->purge();

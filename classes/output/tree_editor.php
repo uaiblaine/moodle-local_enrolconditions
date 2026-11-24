@@ -168,8 +168,10 @@ class tree_editor implements renderable, templatable {
     /**
      * Adds the name and the summary of each condition, for display only.
      *
-     * The summary names what the condition refers to, so a node the current user may not reference and that is
-     * not stored in the instance (a submitted tree comes from the client) gets a generic text instead.
+     * The summary names what the condition refers to, so a node that is not stored in the instance (a submitted
+     * tree comes from the client) gets a generic text unless the current user may reference what it names and its
+     * configuration is valid: the reach check covers only what validation allows (a list within its bound), and a
+     * summary must never name more than the check saw. A stored node is summarised as it is.
      *
      * @param array $node
      * @return array
@@ -180,15 +182,37 @@ class tree_editor implements renderable, templatable {
             $node['name'] = $condition ? $condition->get_name() : $node['type'];
             if (!$condition) {
                 $node['summary'] = get_string('editorunknowntype', 'local_enrolconditions', $node['type']);
-            } else if (editor_access::check_node($node['type'], $node['config'], $this->context, $this->storedkeys) !== null) {
-                $node['summary'] = get_string('editornotavailable', 'local_enrolconditions');
-            } else {
+            } else if ($this->may_summarise($condition, $node['type'], $node['config'])) {
                 $node['summary'] = $condition->get_summary($node['config']);
+            } else {
+                $node['summary'] = get_string('editornotavailable', 'local_enrolconditions');
             }
             $node['known'] = (bool) $condition;
             return $node;
         }
         $node['children'] = array_map([$this, 'with_summaries'], $node['children']);
         return $node;
+    }
+
+    /**
+     * Whether the summary of a node may be shown to the current user.
+     *
+     * @param \local_enrolconditions\condition\base $condition
+     * @param string $type
+     * @param array $config
+     * @return bool True for a node stored unchanged, or a new one that passes the reach check and the validation.
+     */
+    protected function may_summarise(\local_enrolconditions\condition\base $condition, string $type, array $config): bool {
+        if (editor_access::check_node($type, $config, $this->context, $this->storedkeys) !== null) {
+            return false;
+        }
+        try {
+            if (isset($this->storedkeys[editor_access::node_key($type, $config)])) {
+                return true;
+            }
+        } catch (\JsonException $e) {
+            return false;
+        }
+        return !$condition->validate_config($config);
     }
 }

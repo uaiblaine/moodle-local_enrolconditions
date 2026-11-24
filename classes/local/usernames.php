@@ -82,6 +82,84 @@ class usernames {
     }
 
     /**
+     * How the name of a user is recognised in a list of usernames, for the privacy providers.
+     *
+     * A deleted account no longer has its username: core's delete_user() replaces it and keeps
+     * md5(original username) in the email column, and tool_dataprivacy files deletion requests for users already
+     * deleted. Such a user is matched by the hash of each listed name.
+     *
+     * @param int $userid
+     * @return array|null ['username' => lower-case username or null, 'hash' => md5 of the original username or null];
+     *     null when the user does not exist.
+     */
+    public static function matcher(int $userid): ?array {
+        $user = \core_user::get_user($userid, 'id, username, email, deleted');
+        if (!$user) {
+            return null;
+        }
+        if (!empty($user->deleted)) {
+            $hash = core_text::strtolower((string) $user->email);
+            return ['username' => null, 'hash' => preg_match('/^[0-9a-f]{32}$/', $hash) ? $hash : null];
+        }
+        return ['username' => core_text::strtolower($user->username), 'hash' => null];
+    }
+
+    /**
+     * Name under which a user is listed in a list of usernames.
+     *
+     * @param array $list Keys are usernames in lower case.
+     * @param array $matcher Result of matcher().
+     * @return string|null The listed name; null when the user is not listed.
+     */
+    public static function find(array $list, array $matcher): ?string {
+        if ($matcher['username'] !== null) {
+            return isset($list[$matcher['username']]) ? $matcher['username'] : null;
+        }
+        if ($matcher['hash'] === null) {
+            return null;
+        }
+        foreach (array_keys($list) as $name) {
+            if (md5((string) $name) === $matcher['hash']) {
+                return (string) $name;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whether a listed name is one of some users.
+     *
+     * @param string $name Listed name, in lower case.
+     * @param array $matchers Results of matcher().
+     * @return bool
+     */
+    public static function names_any(string $name, array $matchers): bool {
+        foreach ($matchers as $matcher) {
+            if (self::find([$name => true], $matcher) !== null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Adds to a list of users of a context the accounts that some listed names belong to, deleted ones included.
+     *
+     * @param \core_privacy\local\request\userlist $userlist
+     * @param string[] $names Listed names, in lower case.
+     */
+    public static function add_listed_users(\core_privacy\local\request\userlist $userlist, array $names): void {
+        global $DB;
+        foreach (array_chunk(array_values(array_unique(array_map('strval', $names))), 1000) as $chunk) {
+            [$insql, $params] = $DB->get_in_or_equal($chunk, SQL_PARAMS_NAMED);
+            $userlist->add_from_sql('id', "SELECT id FROM {user} WHERE deleted = 0 AND username $insql", $params);
+            // Deleted accounts keep md5(original username) in email ({@see self::matcher()}).
+            [$insql, $params] = $DB->get_in_or_equal(array_map('md5', $chunk), SQL_PARAMS_NAMED);
+            $userlist->add_from_sql('id', "SELECT id FROM {user} WHERE deleted = 1 AND email $insql", $params);
+        }
+    }
+
+    /**
      * Unique values in lower case.
      *
      * @param string[] $values

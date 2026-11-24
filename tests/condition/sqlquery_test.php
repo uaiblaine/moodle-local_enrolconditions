@@ -52,14 +52,61 @@ final class sqlquery_test extends \advanced_testcase {
         $course = $this->getDataGenerator()->create_course();
         $user = $this->getDataGenerator()->create_user();
         $this->define(1, 'All', 'SELECT username FROM {user}');
+        // A cache time of 0 runs the query on every call, through run().
+        set_config('cachettl', 0, queries::COMPONENT);
+        $condition = new condition();
+        $instance = (object) ['courseid' => $course->id];
         $transaction = $DB->start_delegated_transaction();
         try {
-            (new condition())->is_met((int) $user->id, (object) ['courseid' => $course->id], ['query' => '1']);
+            $condition->is_met((int) $user->id, $instance, ['query' => '1']);
             $this->fail('Exception expected');
         } catch (\moodle_exception $e) {
             $this->assertSame('errortransaction', $e->errorcode);
         }
         $transaction->allow_commit();
+
+        // Control: outside a transaction the same call runs the query.
+        $this->assertTrue($condition->is_met((int) $user->id, $instance, ['query' => '1']));
+    }
+
+    public function test_cold_cache_is_not_filled_inside_a_transaction(): void {
+        global $DB;
+        $course = $this->getDataGenerator()->create_course();
+        $sql = 'SELECT username FROM {user}';
+        $this->define(1, 'All', $sql);
+        set_config('cachettl', MINSECS, queries::COMPONENT);
+        $cache = \cache::make(queries::COMPONENT, 'results');
+        $key = queries::cache_key($sql, (int) $course->id);
+
+        $transaction = $DB->start_delegated_transaction();
+        try {
+            queries::get_usernames('1', (int) $course->id);
+            $this->fail('Exception expected');
+        } catch (\moodle_exception $e) {
+            $this->assertSame('errortransaction', $e->errorcode);
+        }
+        $transaction->allow_commit();
+        $this->assertFalse($cache->get($key));
+
+        // Control: outside a transaction the cold cache is filled.
+        $this->assertArrayHasKey('admin', queries::get_usernames('1', (int) $course->id));
+        $this->assertNotFalse($cache->get($key));
+    }
+
+    public function test_run_refuses_inside_a_transaction(): void {
+        global $DB;
+        // The settings page's trial run calls run() directly.
+        $transaction = $DB->start_delegated_transaction();
+        try {
+            queries::run('SELECT username FROM {user}', SITEID, 1);
+            $this->fail('Exception expected');
+        } catch (\moodle_exception $e) {
+            $this->assertSame('errortransaction', $e->errorcode);
+        }
+        $transaction->allow_commit();
+
+        // Control: outside a transaction it runs.
+        $this->assertCount(1, queries::run('SELECT username FROM {user}', SITEID, 1));
     }
 
     /**
@@ -270,5 +317,63 @@ final class sqlquery_test extends \advanced_testcase {
 
     public function test_privacy_is_compliant(): void {
         $this->assertTrue((new \core_privacy\manager())->component_is_compliant('enrolcond_sqlquery'));
+    }
+
+    public function test_cached_path_inside_a_transaction_serves_the_expired_entry(): void {
+        global $DB;
+        $course = $this->getDataGenerator()->create_course();
+        $user = $this->getDataGenerator()->create_user();
+        $sql = "SELECT username FROM {user} WHERE city = 'Late'";
+        set_config('cachettl', MINSECS, queries::COMPONENT);
+        $this->define(1, 'Late', $sql);
+        $condition = new condition();
+        $instance = (object) ['courseid' => $course->id];
+        $cache = \cache::make(queries::COMPONENT, 'results');
+        $key = queries::cache_key($sql, (int) $course->id);
+
+        $this->assertFalse($condition->is_met((int) $user->id, $instance, ['query' => '1']));
+        $DB->set_field('user', 'city', 'Late', ['id' => $user->id]);
+        $entry = $cache->get($key);
+        $entry['time'] -= 2 * MINSECS;
+        $cache->set($key, $entry);
+        $this->forget_request();
+
+        // Inside the caller's transaction the expired list is served and the query does not run.
+        $transaction = $DB->start_delegated_transaction();
+        $this->assertFalse($condition->is_met((int) $user->id, $instance, ['query' => '1']));
+        $transaction->allow_commit();
+        $this->assertSame($entry['time'], $cache->get($key)['time']);
+
+        // Control: outside it, the same call refreshes the entry.
+        $this->forget_request();
+        $this->assertTrue($condition->is_met((int) $user->id, $instance, ['query' => '1']));
+        $this->assertGreaterThan($entry['time'], $cache->get($key)['time']);
+    }
+
+    public function test_expired_entry_is_deleted_after_a_failed_refresh(): void {
+        $course = $this->getDataGenerator()->create_course();
+        $this->getDataGenerator()->create_user(['username' => 'ana']);
+        $broken = "SELECT nothing FROM {user}";
+        $working = "SELECT username FROM {user} WHERE username = 'ana'";
+        set_config('cachettl', MINSECS, queries::COMPONENT);
+        $this->define(1, 'Broken', $broken);
+        $this->define(2, 'Working', $working);
+        $cache = \cache::make(queries::COMPONENT, 'results');
+        $expired = ['time' => time() - 2 * MINSECS, 'usernames' => ['ana' => true]];
+        $brokenkey = queries::cache_key($broken, (int) $course->id);
+        $cache->set($brokenkey, $expired);
+
+        try {
+            queries::get_usernames('1', (int) $course->id);
+            $this->fail('The broken query must fail');
+        } catch (\Throwable $e) {
+            $this->assertFalse($cache->get($brokenkey));
+        }
+
+        // Control: a refresh that works replaces the expired entry.
+        $workingkey = queries::cache_key($working, (int) $course->id);
+        $cache->set($workingkey, ['time' => time() - 2 * MINSECS, 'usernames' => []]);
+        $this->assertSame(['ana' => true], queries::get_usernames('2', (int) $course->id));
+        $this->assertSame(['ana' => true], $cache->get($workingkey)['usernames']);
     }
 }

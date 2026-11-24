@@ -40,8 +40,8 @@ use stdClass;
  * - A state row is written only when core applied the enforcer's own change (see update_status()).
  * - The action "none" only records the failure once per episode (met, then not met).
  *
- * Every change is decided under a core lock per user enrolment, on the row and the state read again under it,
- * and written in one transaction. A check that finds nothing to change takes no lock and writes nothing.
+ * Every change is decided under a core lock per user enrolment, on the instance, the row and the state read again
+ * under it, and written in one transaction. A check that finds nothing to change takes no lock and writes nothing.
  *
  * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
@@ -105,7 +105,13 @@ class enforcer {
     /** @var bool True while the enforcer itself is changing an enrolment. */
     protected static bool $acting = false;
 
-    /** @var array|null Enrolment the core hook saw being written while acting: ['ueid' => int, 'status' => int]. */
+    /** @var int|null User enrolment the enforcer is changing right now; null when it is not acting. */
+    protected static ?int $actingue = null;
+
+    /** @var int|null Status the enforcer is asking core to write to $actingue; null for a removal. */
+    protected static ?int $actingstatus = null;
+
+    /** @var array|null The enforcer's own write as the core hook saw it: ['ueid' => int, 'status' => int]. */
     protected static ?array $applied = null;
 
     /** @var array|null Enrolment methods registered by unit tests, by name; null outside them. */
@@ -194,27 +200,60 @@ class enforcer {
     }
 
     /**
-     * Whether the enforcer is changing an enrolment right now.
+     * Whether the enforcer is changing this user enrolment right now.
      *
-     * Observers use it to tell the enforcer's own changes from changes made by others.
+     * Observers use it to tell the enforcer's own change from a change someone else makes meanwhile: an observer of
+     * another plugin may write another enrolment inside the enforcer's write, and that write is not the enforcer's.
      *
+     * @param int $ueid
      * @return bool
      */
-    public static function is_acting(): bool {
-        return self::$acting;
+    public static function is_acting_on(int $ueid): bool {
+        return self::$acting && self::$actingue === $ueid;
     }
 
     /**
-     * Records that core is about to write an enrolment while the enforcer is acting.
+     * Records that core is about to write the enrolment the enforcer is changing.
      *
      * Called from the hook core_enrol\hook\before_user_enrolment_updated, which core dispatches only when it is
      * about to change the row: a status the row already had dispatches nothing. update_status() reads it back.
+     * Only the row and the status the enforcer asked for are recorded, and only the first time: a write of another
+     * row, or a later write of the same row by someone else inside the enforcer's write, is not the enforcer's.
      *
      * @param stdClass $ue User enrolment as core is about to store it.
      */
     public static function record_applied(stdClass $ue): void {
-        if (self::$acting) {
+        if (
+            self::$applied === null
+            && self::is_acting_on((int) $ue->id)
+            && self::$actingstatus === (int) $ue->status
+        ) {
             self::$applied = ['ueid' => (int) $ue->id, 'status' => (int) $ue->status];
+        }
+    }
+
+    /**
+     * Runs a write of the enforcer on one user enrolment, marked as its own.
+     *
+     * Re-entrant: an observer may run another enforcer inside the write (for an event its write raised), and the
+     * outer write must find its own marks and its own record as it left them.
+     *
+     * @param int $ueid User enrolment being written.
+     * @param int|null $status Status asked of core; null for a removal.
+     * @param callable $work The write.
+     * @return array|null What record_applied() saw of this write; null when core did not apply it.
+     */
+    protected static function as_own_write(int $ueid, ?int $status, callable $work): ?array {
+        $previous = [self::$acting, self::$actingue, self::$actingstatus, self::$applied];
+        self::$acting = true;
+        self::$actingue = $ueid;
+        self::$actingstatus = $status;
+        self::$applied = null;
+        try {
+            $work();
+            return self::$applied;
+        } finally {
+            [self::$acting, self::$actingue, self::$actingstatus, self::$applied] = $previous;
         }
     }
 
@@ -537,7 +576,8 @@ class enforcer {
     /**
      * Whether the enforcer still owns the state of the enrolment.
      *
-     * A suspension is owned while the enrolment is suspended and nobody changed it since.
+     * A record of the action "none" changes nothing, so it is always owned; a suspension is owned while
+     * {@see suspension_still_owned()} says so of the enrolment as it is stored.
      *
      * @param stdClass $state
      * @param stdClass $ue
@@ -547,8 +587,24 @@ class enforcer {
         if ($state->action === self::STATE_NONE) {
             return true;
         }
-        return (int) $ue->status === ENROL_USER_SUSPENDED
-            && (int) $ue->timemodified === (int) $state->uetimemodified;
+        return self::suspension_still_owned($state, (int) $ue->status, (int) $ue->timemodified);
+    }
+
+    /**
+     * Whether a suspension recorded by the enforcer is still the enforcer's, given two facts of the enrolment.
+     *
+     * The only definition of ownership: owns() asks it of the stored row, and the before_user_enrolment_updated
+     * hook ({@see \local_enrolconditions\observer::before_user_enrolment_updated()}) asks it while someone else
+     * writes, with the status core is about to store and the timemodified the row still has. Owned means the
+     * enrolment is (or stays) suspended and nobody changed it since the enforcer recorded its write.
+     *
+     * @param stdClass $state Open state record of the action "suspend".
+     * @param int $status Status of the enrolment.
+     * @param int $timemodified Time the enrolment was last changed before this decision.
+     * @return bool
+     */
+    public static function suspension_still_owned(stdClass $state, int $status, int $timemodified): bool {
+        return $status === ENROL_USER_SUSPENDED && $timemodified === (int) $state->uetimemodified;
     }
 
     /**
@@ -663,7 +719,10 @@ class enforcer {
     }
 
     /**
-     * Takes the lock of an enrolment, decides again on the row and the states read under it, and writes.
+     * Takes the lock of an enrolment, decides again on the instance, the row and the states read under it, and writes.
+     *
+     * The instance passed is only a hint as well: the periodic check loads every instance once for a whole run, and a
+     * teacher may relax the tree, change the action or disable the instance meanwhile. Its row is read again here.
      *
      * @param enforceable $plugin Enrolment method (an enrol_plugin).
      * @param stdClass $instance
@@ -678,6 +737,11 @@ class enforcer {
             return self::OUTCOME_SKIPPED;
         }
         try {
+            $instance = $this->reload_instance($instance);
+            if ($instance === null) {
+                return self::OUTCOME_NOTHING;
+            }
+            $plugin = $this->get_plugin((string) $instance->enrol);
             $ue = $DB->get_record('user_enrolments', ['id' => $ueid]);
             if (!$ue || (int) $ue->enrolid !== (int) $instance->id) {
                 return self::OUTCOME_NOTHING;
@@ -713,6 +777,27 @@ class enforcer {
         } finally {
             $lock->release();
         }
+    }
+
+    /**
+     * The instance as stored now, when the enforcer may still act on it.
+     *
+     * @param stdClass $instance Instance as loaded earlier.
+     * @return stdClass|null Null when it was deleted, disabled, or moved to a method this enforcer does not handle.
+     */
+    protected function reload_instance(stdClass $instance): ?stdClass {
+        global $DB;
+        $fresh = $DB->get_record('enrol', ['id' => $instance->id]);
+        if (!$fresh) {
+            return null;
+        }
+        if ((int) $fresh->status !== ENROL_INSTANCE_ENABLED) {
+            return null;
+        }
+        if ($fresh->enrol !== $instance->enrol || !$this->get_plugin((string) $fresh->enrol)) {
+            return null;
+        }
+        return $fresh;
     }
 
     /**
@@ -850,12 +935,7 @@ class enforcer {
         switch ($plan->do) {
             case self::DO_REMOVE:
                 conditions_not_met::create_from_enrolment($instance, $ue, 'remove')->trigger();
-                self::$acting = true;
-                try {
-                    $plugin->unenrol_user($instance, (int) $ue->userid);
-                } finally {
-                    self::$acting = false;
-                }
+                self::as_own_write((int) $ue->id, null, fn() => $plugin->unenrol_user($instance, (int) $ue->userid));
                 return self::OUTCOME_REMOVED;
             case self::DO_RECORD:
                 $stateid = $this->insert_state($instance, $ue, self::STATE_NONE, $reason);
@@ -900,15 +980,11 @@ class enforcer {
      * @return bool Whether core applied this status to this enrolment.
      */
     protected function update_status(enforceable $plugin, stdClass $instance, stdClass $ue, int $status): bool {
-        self::$acting = true;
-        self::$applied = null;
-        try {
-            $plugin->update_user_enrol($instance, (int) $ue->userid, $status);
-            $applied = self::$applied;
-        } finally {
-            self::$acting = false;
-            self::$applied = null;
-        }
+        $applied = self::as_own_write(
+            (int) $ue->id,
+            $status,
+            fn() => $plugin->update_user_enrol($instance, (int) $ue->userid, $status)
+        );
         return $applied !== null && $applied['ueid'] === (int) $ue->id && $applied['status'] === $status;
     }
 

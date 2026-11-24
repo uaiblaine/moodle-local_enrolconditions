@@ -23,7 +23,9 @@ use stdClass;
  * Condition for unit tests whose every answer comes from its configuration.
  *
  * Configuration: met (bool), the result of is_met(); describethrows (bool), whether get_description() throws;
- * denied (string), the error check_access() returns. It counts the calls of is_met().
+ * denied (string), the error check_access() returns; invalid (string), the error validate_config() returns;
+ * throwafter (int), is_met() throws once it was called more than that many times since the last reset of $calls.
+ * It counts the calls of is_met().
  *
  * @package    local_enrolconditions
  * @copyright  2026 Anderson Blaine
@@ -46,6 +48,9 @@ class scripted_condition extends \local_enrolconditions\condition\base {
     #[\Override]
     public function is_met(int $userid, stdClass $instance, array $config): bool {
         self::$calls++;
+        if (isset($config['throwafter']) && self::$calls > (int) $config['throwafter']) {
+            throw new \moodle_exception('error');
+        }
         return !empty($config['met']);
     }
 
@@ -73,6 +78,6 @@ class scripted_condition extends \local_enrolconditions\condition\base {
 
     #[\Override]
     public function validate_config(array $config): array {
-        return [];
+        return isset($config['invalid']) ? ['invalid' => (string) $config['invalid']] : [];
     }
 }

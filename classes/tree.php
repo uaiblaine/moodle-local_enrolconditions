@@ -185,10 +185,11 @@ class tree {
      *
      * With a context, every condition that is not stored unchanged in $previous (same type and
      * configuration, wherever it sits in the tree, see {@see editor_access::check_node()}, the one definition of
-     * that rule) is also asked base::check_access(): whether the
-     * user saving the tree may reference what its configuration names. A condition already stored
-     * is not asked again, so a teacher can edit a tree in which somebody else wrote a condition the
-     * teacher could not have written.
+     * that rule) is first asked base::check_access(): whether the user saving the tree may reference what its
+     * configuration names; only when it may is its configuration validated, so a missing record and one out of
+     * reach get the same answer ({@see editor_access::validate_node()}). A condition already stored is not asked
+     * again, so a teacher can edit a tree in which somebody else wrote a condition the teacher could not have
+     * written, and learns precisely when a record it names is gone.
      *
      * @param string[] $allowedtypes Types accepted even when not enabled.
      * @param \context|null $context Course context of the enrolment instance; null skips the access check.
@@ -212,13 +213,7 @@ class tree {
             if (!$condition) {
                 return;
             }
-            $messages = $condition->validate_config($node['config']);
-            if (!$messages && $context) {
-                $denied = editor_access::check_node($type, $node['config'], $context, $stored);
-                if ($denied !== null) {
-                    $messages[] = $denied;
-                }
-            }
+            $messages = editor_access::validate_node($condition, $type, $node['config'], $context, $stored);
             foreach ($messages as $message) {
                 $errors[] = get_string(
                     'treeconditionerror',
@@ -488,6 +483,19 @@ class tree {
             }
             return $node;
         }));
+    }
+
+    /**
+     * Copy of the tree with every condition node passed through a function, keeping the groups.
+     *
+     * The function changes configurations only (the privacy providers remove a person from a list); the structure
+     * is not checked again.
+     *
+     * @param callable $callback Receives a condition node (type, negate, config) and returns it changed.
+     * @return self
+     */
+    public function with_conditions(callable $callback): self {
+        return new self(self::map_conditions($this->root, $callback));
     }
 
     /**

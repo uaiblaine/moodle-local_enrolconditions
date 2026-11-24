@@ -92,6 +92,9 @@ docs/                upstream's documentation (en, pt_BR), export-ignored
   engine version it needs. Reason: the dependency is by version number, and a stale pair fails at install.
 - **The audit of 2026-11-23** is in `~/dev/moodle-dev/data/audits/enrol_conditional-local_enrolconditions-2026-11-23.md`
   (not versioned). Read it before touching enforcement, backup/restore or the SQL list condition.
+- **The branch model is upstream's: `main` only.** Fleet work lives on feature branches and reaches upstream as pull
+  requests, a separate piece of work; there is no `MOODLE_503_STABLE`. `mutations/gates.conf` holds the mutation
+  gates: before a push sweep both database families with `mdl mutate <repo> mutations/gates.conf --fast --changed <base>`.
 - `AGENTS.md` is upstream's file and only points here.
 
 ## Architecture gotchas
@@ -99,23 +102,27 @@ docs/                upstream's documentation (en, pt_BR), export-ignored
 - **Conditions are stateless; their configuration is an array stored as JSON by the caller.** A condition keeps
   nothing between calls, so the same instance can be evaluated for any user, node or request.
 - **`validate_config()` and `check_access()` run wherever a tree is saved** (`tree::validate()` with the course
-  context and the stored tree), never only in the dialog. Reason: a tree can be posted to the instance form or
-  passed to the method's API without the dialog. A method that restores a tree stores it as it comes and relies
-  on evaluation failing closed (an invalid tree is unknown: nobody enrols).
+  context and the stored tree), never only in the dialog. For a new or changed node `check_access()` is asked
+  BEFORE `validate_config()` (`editor_access::validate_node()`), and a record that does not exist answers like one out
+  of reach. Reason: no existence oracle for ids a user typed; a stored node whose record is gone still gets the
+  precise `missingcourse` / `missingcohort`. A method that restores a tree stores it as it comes and relies on
+  evaluation failing closed (an invalid tree is unknown: nobody enrols).
 - **A condition provided through the hook overrides `get_type()` with an identifier prefixed with its component.**
   Reason: types of different plugins must not collide in a stored tree.
 - **`is_met()` may throw when it cannot decide**: the result is *unknown*, which blocks a new enrolment and never
   suspends anybody.
 - **Only suspensions recorded in `local_enrolconditions_state` are ever reactivated.** Reason: an enrolment someone
   else suspended must stay suspended; `uetimemodified` tells the enforcer the enrolment was changed behind its back.
-- **A task, cache or state decision runs on any node** (fleet cluster-first rules): the periodic check keeps its
-  position (`periodicposition`, `enforcer::get_position()`) in plugin config, not in a node-local file.
+- **The periodic check keeps its position** (`periodicposition`) in plugin config, never in a node-local file:
+  a task runs on any node.
 - **Ownership of a suspension is recorded only when core applied the enforcer's own write** (the
-  `before_user_enrolment_updated` hook firing while the enforcer acts), decided under a core lock per user
-  enrolment after re-reading the row. Reason: the state row is the proof that the enforcer, and nobody else,
-  suspended it; a guess from the current status would reactivate what someone else suspended.
-- **Event re-checks are queued adhoc tasks** (`\local_enrolconditions\task\recheck_user`, one per user) with a depth
-  limit of 5. Reason: two instances that depend on each other would otherwise loop through their own events.
+  `before_user_enrolment_updated` hook firing while the enforcer acts). Reason: the state row is the proof that the
+  enforcer, and nobody else, suspended it; a guess from the current status would reactivate what someone else did.
+- **The enforcer re-reads the instance, the enrolment and the open states under the lock**; the objects passed in are
+  hints. Reason: a teacher may change the tree, action or status during a run, and an instance may be gone.
+- **Event re-checks are queued adhoc tasks** (`\local_enrolconditions\task\recheck_user`, one per user, depth limit
+  5) **that carry a slot.** Reason: an event during a running task must not be swallowed by core's de-duplication;
+  the depth limit stops two interdependent instances from looping.
 - **The periodic check is time-budgeted** (`checktimelimit`) **and pages by `(enrolid, userid)`**. Reason: a run
   that cannot finish in its budget resumes where it stopped, on any node.
 - **A disabled or failing condition is "unknown" and never changes anyone.** Reason: an outage of a condition
@@ -123,15 +130,19 @@ docs/                upstream's documentation (en, pt_BR), export-ignored
 - **`check_access()` is the reach rule** (may the saving user reference what a condition names), asked through
   `editor_access::check_node()`, which `tree::validate()`, the dialog and the editor all call; a node already
   stored unchanged is not re-checked. Reason: a teacher must be able to edit a tree an administrator wrote.
+- **A new `userfile` node may reference only a file its own user uploaded** and no stored tree uses. Reason: another
+  teacher's unsaved file would expose or share that list.
+- **`tree_writer` is the optional interface through which the engine erases usernames from a method's stored trees**
+  (privacy requests); it never validates for the current user. Reason: its caller is the privacy system, with no
+  user to check reach for.
 - **Subplugin tests live under the root `tests/condition/`.** Reason: the plugin CI runs only the root suite.
 - **`lang/pt_br`** (and `condition/<name>/lang/pt_br/`) exists, in lockstep with `lang/en`, `export-ignore`d; in
   Portuguese "inscrição", never "matrícula".
 
 ## Testing notes
 
-`tests/fixtures/` holds a fake condition, a fake enforceable method and a hook fixture; the privacy provider has its own
-test. Each subplugin's tests live under `tests/condition/`. No Behat here: the editor is driven by the
-method's features in `enrol_conditional`.
+`tests/fixtures/` holds the fake condition, enforceable and tree-writer methods; subplugin tests live under
+`tests/condition/`. No Behat here: the method's features drive the editor.
 
 ## When in doubt
 

@@ -22,7 +22,9 @@ use local_enrolconditions\local\enforcer;
  * Re-checks the enrolments of the instances with the periodic check mode, in chunks, within a time budget.
  *
  * Each run continues the cycle where the previous one stopped (the position is in the plugin settings, shared by
- * every node) and stops when the budget (checktimelimit) is spent or the cycle is complete.
+ * every node) and stops when the budget (checktimelimit) is spent or the cycle is complete. A run ends with a summary
+ * line in the task log: the enrolments checked, the count of each outcome and where the next run continues; and,
+ * when some could not be checked, a line saying how many.
  *
  * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
@@ -51,8 +53,30 @@ class check_conditions extends \core\task\scheduled_task {
         $timelimit = get_config('local_enrolconditions', 'checktimelimit');
         $timelimit = ($timelimit === false || $timelimit === '') ? self::DEFAULT_TIME_LIMIT : max(0, (int) $timelimit);
         $outcomes = $enforcer->check_periodic($chunk, $timelimit, new \text_progress_trace());
-        [$instanceid, $userid] = enforcer::get_position();
+        mtrace(self::summary($outcomes, enforcer::get_position()));
+        $errors = count(array_keys($outcomes, enforcer::OUTCOME_ERROR, true));
+        if ($errors) {
+            mtrace("{$errors} enrolments could not be checked (see the messages above); the next cycle checks them again.");
+        }
+    }
+
+    /**
+     * Summary line of a run.
+     *
+     * @param string[] $outcomes Outcome by user enrolment id, as enforcer::check_periodic() returns them.
+     * @param int[] $position Position after the run: [instance id, user id], [0, 0] when the cycle is complete.
+     * @return string
+     */
+    public static function summary(array $outcomes, array $position): string {
+        $counts = array_count_values($outcomes);
+        ksort($counts);
+        $parts = [];
+        foreach ($counts as $outcome => $count) {
+            $parts[] = "{$outcome}: {$count}";
+        }
+        [$instanceid, $userid] = $position;
         $where = $instanceid ? "the next run continues at instance {$instanceid}, after user {$userid}" : 'the cycle is complete';
-        mtrace(count($outcomes) . " enrolments checked; {$where}.");
+        $detail = $parts ? ' (' . implode(', ', $parts) . ')' : '';
+        return count($outcomes) . " enrolments checked{$detail}; {$where}.";
     }
 }

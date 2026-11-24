@@ -26,6 +26,7 @@ global $CFG;
 require_once(__DIR__ . '/fixtures/fake_condition.php');
 require_once(__DIR__ . '/fixtures/fake_enforceable.php');
 require_once(__DIR__ . '/fixtures/refusing_lock_factory.php');
+require_once(__DIR__ . '/fixtures/scripted_condition.php');
 
 /**
  * Tests of the generic enforcer with an enrolment method other than enrol_conditional.
@@ -58,6 +59,8 @@ final class enforcer_test extends \advanced_testcase {
         $this->resetAfterTest();
         manager::reset_caches();
         manager::register_for_testing('fake', new \enrolcond_fake\condition());
+        manager::register_for_testing('scripted', new fixtures\scripted_condition());
+        fixtures\scripted_condition::$calls = 0;
         $this->plugin = new \local_enrolconditions_fake_enforceable();
         // Observers and the hook callback build their own enforcer: they see the fake method too.
         enforcer::register_plugins_for_testing(['manual' => $this->plugin]);
@@ -540,5 +543,296 @@ final class enforcer_test extends \advanced_testcase {
         $this->assertEqualsCanonicalizing([enforcer::OUTCOME_ERROR, enforcer::OUTCOME_SUSPENDED], array_values($outcomes));
         $this->assertSame(ENROL_USER_SUSPENDED, $this->ue_status($healthy));
         $this->assertSame(ENROL_USER_ACTIVE, $this->ue_status($broken));
+    }
+
+    /**
+     * An instance object loaded before a teacher changed its stored row, as the periodic check keeps it for a run.
+     *
+     * @param callable $change Receives the instance id and changes the stored row.
+     * @return \stdClass The stale instance object, with the remove action and a tree the test user fails.
+     */
+    protected function stale_instance(callable $change): \stdClass {
+        $instance = $this->create_instance(enforceable::ACTION_REMOVE, []);
+        $change((int) $instance->id);
+        return $instance;
+    }
+
+    public function test_a_stale_instance_is_read_again_under_the_lock(): void {
+        global $DB;
+        $cases = [
+            'conditions removed' => fn(int $id) => $DB->set_field('enrol', 'customtext1', '', ['id' => $id]),
+            'instance disabled' => fn(int $id) => $DB->set_field('enrol', 'status', ENROL_INSTANCE_DISABLED, ['id' => $id]),
+            'instance deleted' => fn(int $id) => $DB->delete_records('enrol', ['id' => $id]),
+            'method no longer enforceable' => fn(int $id) => $DB->set_field('enrol', 'enrol', 'self', ['id' => $id]),
+        ];
+        foreach ($cases as $name => $change) {
+            $instance = $this->stale_instance($change);
+            $this->assertSame(enforcer::OUTCOME_NOTHING, $this->enforcer->check_user($instance, $this->user->id), $name);
+            $this->assertSame(ENROL_USER_ACTIVE, $this->ue_status($instance), $name);
+            $this->assertSame([], $this->states($instance), $name);
+        }
+
+        // The action became "none": the failure is only recorded, the enrolment stays.
+        $instance = $this->stale_instance(
+            fn(int $id) => $DB->set_field('enrol', 'customint8', enforceable::ACTION_NONE, ['id' => $id])
+        );
+        $this->assertSame(enforcer::OUTCOME_RECORDED, $this->enforcer->check_user($instance, $this->user->id));
+        $this->assertSame(ENROL_USER_ACTIVE, $this->ue_status($instance));
+        $this->assertSame(enforcer::STATE_NONE, $this->states($instance)[0]->action);
+
+        // Control: the same stale object of an unchanged row removes the enrolment.
+        $instance = $this->stale_instance(fn(int $id) => null);
+        $this->assertSame(enforcer::OUTCOME_REMOVED, $this->enforcer->check_user($instance, $this->user->id));
+        $this->assertNull($this->ue_status($instance));
+    }
+
+    public function test_periodic_run_decides_on_the_instance_as_stored_now(): void {
+        global $DB;
+        set_config(enforcer::POSITION_SETTING, '', 'local_enrolconditions');
+        $instance = $this->create_instance(enforceable::ACTION_REMOVE, [], enforceable::CHECK_PERIODIC);
+        $other = $this->enrol_new_user($instance);
+        // The run loaded the instance before the teacher relaxed the tree; the first row it checks sees the change.
+        $relaxed = $this->tree([(int) $this->user->id, $other]);
+        $enforcer = new class (['manual' => $this->plugin], $relaxed) extends enforcer {
+            /**
+             * Constructor.
+             *
+             * @param array $plugins
+             * @param string $relaxed Tree the teacher stores while the run goes on.
+             */
+            public function __construct(array $plugins, /** @var string */ protected string $relaxed) {
+                parent::__construct($plugins);
+            }
+
+            #[\Override]
+            protected function check_rows(array $ues, array $instances, ?\progress_trace $trace = null): array {
+                global $DB;
+                $DB->set_field('enrol', 'customtext1', $this->relaxed, ['id' => array_key_first($instances)]);
+                return parent::check_rows($ues, $instances, $trace);
+            }
+        };
+        $outcomes = $enforcer->check_periodic(10, 60);
+        $this->assertSame([enforcer::OUTCOME_NOTHING, enforcer::OUTCOME_NOTHING], array_values($outcomes));
+        $this->assertSame(2, $DB->count_records('user_enrolments', ['enrolid' => $instance->id]));
+    }
+
+    public function test_a_suspension_changed_behind_the_hooks_is_not_reactivated(): void {
+        global $DB;
+        // Still suspended, but changed since (another writer that fired no hook): not owned any more.
+        $instance = $this->create_instance(enforceable::ACTION_SUSPEND, []);
+        $this->enforcer->check_user($instance, $this->user->id);
+        $ue = $this->ue($instance);
+        $DB->set_field('user_enrolments', 'timemodified', (int) $ue->timemodified + 100, ['id' => $ue->id]);
+        $this->set_allowed($instance, [(int) $this->user->id]);
+        $this->assertSame(enforcer::OUTCOME_NOTHING, $this->enforcer->check_user($instance, $this->user->id));
+        $this->assertSame(ENROL_USER_SUSPENDED, $this->ue_status($instance));
+        $this->assertSame(enforcer::CLOSE_EXTERNAL, $this->states($instance)[0]->closereason);
+
+        // Control: unchanged, the same suspension is reactivated.
+        $other = $this->create_instance(enforceable::ACTION_SUSPEND, []);
+        $this->enforcer->check_user($other, $this->user->id);
+        $this->set_allowed($other, [(int) $this->user->id]);
+        $this->assertSame(enforcer::OUTCOME_REACTIVATED, $this->enforcer->check_user($other, $this->user->id));
+    }
+
+    public function test_a_suspension_lifted_behind_the_hooks_is_suspended_again(): void {
+        global $DB;
+        // Active again with the same timemodified (another writer in the same second): the open row is not owned,
+        // so a failing check suspends again under a new row instead of keeping the old one.
+        $instance = $this->create_instance(enforceable::ACTION_SUSPEND, []);
+        $this->enforcer->check_user($instance, $this->user->id);
+        $DB->set_field('user_enrolments', 'status', ENROL_USER_ACTIVE, ['id' => $this->ue($instance)->id]);
+        $this->assertSame(enforcer::OUTCOME_SUSPENDED, $this->enforcer->check_user($instance, $this->user->id));
+        $states = $this->states($instance);
+        $this->assertCount(2, $states);
+        $this->assertSame(enforcer::CLOSE_EXTERNAL, $states[0]->closereason);
+        $this->assertNull($states[1]->timeclosed);
+
+        // Control: an owned suspension that still fails is kept as it is.
+        $this->assertSame(enforcer::OUTCOME_NOTHING, $this->enforcer->check_user($instance, $this->user->id));
+        $this->assertCount(2, $this->states($instance));
+    }
+
+    public function test_suspension_still_owned_is_the_one_predicate(): void {
+        $state = (object) ['action' => enforcer::STATE_SUSPEND, 'uetimemodified' => 1000];
+        $this->assertTrue(enforcer::suspension_still_owned($state, ENROL_USER_SUSPENDED, 1000));
+        $this->assertFalse(enforcer::suspension_still_owned($state, ENROL_USER_ACTIVE, 1000));
+        $this->assertFalse(enforcer::suspension_still_owned($state, ENROL_USER_SUSPENDED, 1001));
+        $this->assertTrue(enforcer::owns($state, (object) ['status' => ENROL_USER_SUSPENDED, 'timemodified' => 1000]));
+        $none = (object) ['action' => enforcer::STATE_NONE];
+        $this->assertTrue(enforcer::owns($none, (object) ['status' => ENROL_USER_ACTIVE, 'timemodified' => 1]));
+    }
+
+    public function test_unknown_never_removes(): void {
+        global $DB;
+        $instance = $this->create_instance(enforceable::ACTION_REMOVE, []);
+        $tree = json_encode(['op' => 'and', 'children' => [['type' => 'date', 'config' => ['to' => time() - HOURSECS]]]]);
+        $DB->set_field('enrol', 'customtext1', $tree, ['id' => $instance->id]);
+        $instance->customtext1 = $tree;
+
+        set_config('disabled', 1, 'enrolcond_date');
+        $this->assertSame(enforcer::OUTCOME_UNKNOWN, $this->enforcer->check_user($instance, $this->user->id));
+        $this->assertSame(ENROL_USER_ACTIVE, $this->ue_status($instance));
+
+        // Control: enabled, the same expired period removes the enrolment.
+        unset_config('disabled', 'enrolcond_date');
+        $this->assertSame(enforcer::OUTCOME_REMOVED, $this->enforcer->check_user($instance, $this->user->id));
+        $this->assertNull($this->ue_status($instance));
+    }
+
+    public function test_unknown_explanation_under_the_lock_writes_nothing(): void {
+        global $DB;
+        // Not met for the check without the lock and the value read under it, unknown for the explanation after.
+        $instance = $this->create_instance(enforceable::ACTION_SUSPEND, []);
+        $tree = json_encode(['op' => 'and', 'children' => [
+            ['type' => 'scripted', 'config' => ['met' => false, 'throwafter' => 2]],
+        ]]);
+        $DB->set_field('enrol', 'customtext1', $tree, ['id' => $instance->id]);
+        $instance->customtext1 = $tree;
+
+        $this->assertSame(enforcer::OUTCOME_UNKNOWN, $this->enforcer->check_user($instance, $this->user->id));
+        $this->assertDebuggingCalled();
+        $this->assertSame(3, fixtures\scripted_condition::$calls);
+        $this->assertSame(ENROL_USER_ACTIVE, $this->ue_status($instance));
+        $this->assertSame([], $this->states($instance));
+
+        // Control: answering not met every time, the same check suspends.
+        fixtures\scripted_condition::$calls = -10;
+        $this->assertSame(enforcer::OUTCOME_SUSPENDED, $this->enforcer->check_user($instance, $this->user->id));
+    }
+
+    public function test_failing_row_inside_the_callers_transaction_is_rethrown(): void {
+        global $DB;
+        // A transaction of the test's own is what is tested: no test transaction around it.
+        $this->preventResetByRollback();
+        $broken = $this->create_instance(enforceable::ACTION_SUSPEND, [], enforceable::CHECK_LOGIN);
+        $DB->set_field('enrol', 'customchar1', 'throw', ['id' => $broken->id]);
+
+        $transaction = $DB->start_delegated_transaction();
+        try {
+            $this->enforcer->check_user_in_mode($this->user->id, enforceable::CHECK_LOGIN, 'manual');
+            $this->fail('The failure must reach the caller that opened the transaction.');
+        } catch (\moodle_exception $e) {
+            $this->assertSame('error', $e->errorcode);
+        }
+        $transaction->allow_commit();
+
+        // Control: outside a transaction the same row is reported and the check goes on.
+        $outcomes = $this->enforcer->check_user_in_mode($this->user->id, enforceable::CHECK_LOGIN, 'manual');
+        $this->assertDebuggingCalled();
+        $this->assertSame([enforcer::OUTCOME_ERROR], array_values($outcomes));
+    }
+
+    public function test_position_is_saved_after_each_chunk_of_a_run_that_goes_on(): void {
+        set_config(enforcer::POSITION_SETTING, '', 'local_enrolconditions');
+        $instance = $this->create_instance(enforceable::ACTION_NONE, [], enforceable::CHECK_PERIODIC);
+        $users = [(int) $this->user->id, $this->enrol_new_user($instance), $this->enrol_new_user($instance)];
+        sort($users);
+        $enforcer = new class (['manual' => $this->plugin]) extends enforcer {
+            /** @var array[] Position saved when each chunk started. */
+            public array $seen = [];
+
+            #[\Override]
+            protected function check_rows(array $ues, array $instances, ?\progress_trace $trace = null): array {
+                $this->seen[] = self::get_position();
+                return parent::check_rows($ues, $instances, $trace);
+            }
+        };
+
+        // Chunks of one with time to spare: one run, three chunks, the position saved between them.
+        $this->assertCount(3, $enforcer->check_periodic(1, 60));
+        $id = (int) $instance->id;
+        $this->assertSame([[0, 0], [$id, $users[0]], [$id, $users[1]]], $enforcer->seen);
+        // Control: the cycle completes, so the position is reset at the end.
+        $this->assertSame([0, 0], enforcer::get_position());
+    }
+
+    /**
+     * Fake method whose update_user_enrol() runs a callback once, right after core wrote the row.
+     *
+     * Stands in for an observer of user_enrolment_updated in another plugin, which core runs inside the write.
+     *
+     * @return \local_enrolconditions_fake_enforceable
+     */
+    protected function plugin_with_inner_writer(): \local_enrolconditions_fake_enforceable {
+        return new class extends \local_enrolconditions_fake_enforceable {
+            /** @var callable|null Runs once after the next write. */
+            public $after = null;
+
+            #[\Override]
+            public function update_user_enrol(\stdClass $instance, $userid, $status = null, $timestart = null, $timeend = null) {
+                parent::update_user_enrol($instance, $userid, $status, $timestart, $timeend);
+                if ($this->after) {
+                    $after = $this->after;
+                    $this->after = null;
+                    $after();
+                }
+            }
+        };
+    }
+
+    public function test_a_write_to_another_row_during_the_enforcers_write_keeps_the_suspension_owned(): void {
+        global $DB;
+        $plugin = $this->plugin_with_inner_writer();
+        enforcer::register_plugins_for_testing(['manual' => $plugin]);
+        $enforcer = new enforcer(['manual' => $plugin]);
+        $instance = $this->create_instance(enforceable::ACTION_SUSPEND, []);
+        // Another enrolment of the user, suspended by the enforcer some time ago.
+        $other = $this->create_instance(enforceable::ACTION_SUSPEND, []);
+        $this->assertSame(enforcer::OUTCOME_SUSPENDED, $enforcer->check_user($other, $this->user->id));
+        $otherue = $this->ue($other);
+        $DB->set_field('user_enrolments', 'timemodified', time() - 100, ['id' => $otherue->id]);
+        $DB->set_field(enforcer::TABLE, 'uetimemodified', time() - 100, ['userenrolmentid' => $otherue->id]);
+        // While the enforcer writes the first one, an observer of another plugin changes the dates of the other.
+        $plugin->after = fn() => $plugin->update_user_enrol($other, $this->user->id, null, time() - 50);
+
+        $this->assertSame(enforcer::OUTCOME_SUSPENDED, $enforcer->check_user($instance, $this->user->id));
+        $states = $this->states($instance, true);
+        $this->assertCount(1, $states);
+        $this->assertTrue(enforcer::owns($states[0], $this->ue($instance)));
+        // The other row was changed by someone else, as the hook sees any such change: its dates only, so kept.
+        $otherstates = $this->states($other, true);
+        $this->assertCount(1, $otherstates);
+        $this->assertTrue(enforcer::owns($otherstates[0], $this->ue($other)));
+
+        // Control: the reactivation of the owned suspension still works.
+        $this->set_allowed($instance, [(int) $this->user->id]);
+        $this->assertSame(enforcer::OUTCOME_REACTIVATED, $enforcer->check_user($instance, $this->user->id));
+    }
+
+    public function test_only_the_first_write_of_the_acting_row_is_the_enforcers(): void {
+        $plugin = $this->plugin_with_inner_writer();
+        enforcer::register_plugins_for_testing(['manual' => $plugin]);
+        $instance = $this->create_instance(enforceable::ACTION_SUSPEND, []);
+        // An observer of another plugin lifts the suspension inside the enforcer's write.
+        $plugin->after = fn() => $plugin->update_user_enrol($instance, $this->user->id, ENROL_USER_ACTIVE);
+
+        $enforcer = new enforcer(['manual' => $plugin]);
+        $this->assertSame(enforcer::OUTCOME_SUSPENDED, $enforcer->check_user($instance, $this->user->id));
+        $states = $this->states($instance, true);
+        $this->assertCount(1, $states);
+        // The enforcer's suspension is recorded; the later change is someone else's, so it no longer owns it.
+        $this->assertFalse(enforcer::owns($states[0], $this->ue($instance)));
+        $this->assertSame(ENROL_USER_ACTIVE, $this->ue_status($instance));
+    }
+
+    public function test_a_nested_enforcer_call_does_not_clear_the_outer_record(): void {
+        global $DB;
+        $plugin = $this->plugin_with_inner_writer();
+        enforcer::register_plugins_for_testing(['manual' => $plugin]);
+        $instance = $this->create_instance(enforceable::ACTION_SUSPEND, []);
+        $other = $this->create_instance(enforceable::ACTION_SUSPEND, []);
+        $plugin->after = fn() => (new enforcer(['manual' => $plugin]))->check_user($other, $this->user->id);
+
+        $enforcer = new enforcer(['manual' => $plugin]);
+        $this->assertSame(enforcer::OUTCOME_SUSPENDED, $enforcer->check_user($instance, $this->user->id));
+        $this->assertCount(1, $this->states($instance, true));
+        $this->assertCount(1, $this->states($other, true));
+        $this->assertSame(ENROL_USER_SUSPENDED, $this->ue_status($other));
+        // Nothing is marked as the enforcer's own once it is done, whichever row is asked.
+        foreach ([$instance, $other] as $each) {
+            $ueid = (int) $DB->get_field('user_enrolments', 'id', ['enrolid' => $each->id, 'userid' => $this->user->id]);
+            $this->assertFalse(enforcer::is_acting_on($ueid));
+        }
     }
 }

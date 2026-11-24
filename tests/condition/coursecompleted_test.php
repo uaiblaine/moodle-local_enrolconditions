@@ -154,26 +154,40 @@ final class coursecompleted_test extends \advanced_testcase {
     }
 
     public function test_check_access_follows_course_visibility(): void {
+        global $DB;
         $this->resetAfterTest();
         $generator = $this->getDataGenerator();
         $course = $generator->create_course();
         $context = \context_course::instance($course->id);
         $teacher = $generator->create_and_enrol($course, 'editingteacher');
         $hidden = $generator->create_course(['visible' => 0]);
-        $enrolledhidden = $generator->create_course(['visible' => 0]);
-        $generator->enrol_user($teacher->id, $enrolledhidden->id, 'student');
         $visible = $generator->create_course();
+        // Enrolled as a student in a hidden course: enrolled, but core's course selector does not list it.
+        $studenthidden = $generator->create_course(['visible' => 0]);
+        $generator->enrol_user($teacher->id, $studenthidden->id, 'student');
+        // Enrolled as a teacher in a hidden course: moodle/course:viewhiddencourses there, so core lists it.
+        $teacherhidden = $generator->create_course(['visible' => 0]);
+        $generator->enrol_user($teacher->id, $teacherhidden->id, 'editingteacher');
+        // A visible course in a category whose course list the user may not see: only the enrolment shows it.
+        $category = $generator->create_category();
+        $userrole = (int) $DB->get_field('role', 'id', ['shortname' => 'user']);
+        $catcontext = \context_coursecat::instance($category->id);
+        assign_capability('moodle/category:viewcourselist', CAP_PROHIBIT, $userrole, $catcontext->id, true);
+        $unlisted = $generator->create_course(['category' => $category->id]);
+        $enrolledunlisted = $generator->create_course(['category' => $category->id]);
+        $generator->enrol_user($teacher->id, $enrolledunlisted->id, 'student');
         $condition = new condition();
+        $noaccess = get_string('noaccess', 'enrolcond_coursecompleted');
 
         $this->setUser($teacher);
-        $this->assertSame(
-            get_string('noaccess', 'enrolcond_coursecompleted'),
-            $condition->check_access(['courseid' => $hidden->id], $context)
-        );
-        $this->assertNotNull($condition->check_access(['courseid' => 999999], $context));
-        // Controls: a visible course, and a hidden course the teacher is enrolled in (core's course element shows both).
+        $this->assertSame($noaccess, $condition->check_access(['courseid' => $hidden->id], $context));
+        $this->assertSame($noaccess, $condition->check_access(['courseid' => 999999], $context));
+        $this->assertSame($noaccess, $condition->check_access(['courseid' => $studenthidden->id], $context));
+        $this->assertSame($noaccess, $condition->check_access(['courseid' => $unlisted->id], $context));
+        // Controls: a visible course, a hidden course the teacher may see, a listed-by-enrolment course.
         $this->assertNull($condition->check_access(['courseid' => $visible->id], $context));
-        $this->assertNull($condition->check_access(['courseid' => $enrolledhidden->id], $context));
+        $this->assertNull($condition->check_access(['courseid' => $teacherhidden->id], $context));
+        $this->assertNull($condition->check_access(['courseid' => $enrolledunlisted->id], $context));
         $this->setAdminUser();
         $this->assertNull($condition->check_access(['courseid' => $hidden->id], $context));
     }

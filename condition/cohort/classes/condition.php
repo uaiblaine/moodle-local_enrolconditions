@@ -106,8 +106,12 @@ class condition extends \local_enrolconditions\condition\base {
     public function validate_config(array $config): array {
         global $DB;
         $cohortid = (int) ($config['cohortid'] ?? 0);
-        if ($cohortid <= 0 || !$DB->record_exists('cohort', ['id' => $cohortid])) {
+        if ($cohortid <= 0) {
             return ['cohortid' => get_string('invalidcohort', 'enrolcond_cohort')];
+        }
+        if (!$DB->record_exists('cohort', ['id' => $cohortid])) {
+            // Reached only for a node stored unchanged (or without a reach check): a new one is refused before.
+            return ['cohortid' => get_string('missingcohort', 'enrolcond_cohort')];
         }
         return [];
     }
@@ -115,7 +119,8 @@ class condition extends \local_enrolconditions\condition\base {
     /**
      * The cohort must be one the user may use in the course: the rule of cohort_can_view_cohort() from the course
      * context, which is also what cohort_get_available_cohorts() lists in the dialog (a cohort of a parent
-     * context, visible or with moodle/cohort:view in its context).
+     * context, visible or with moodle/cohort:view in its context). A cohort that does not exist gets the same
+     * answer as one out of reach (cohort_can_view_cohort() is false for it).
      *
      * @param array $config
      * @param \context $context Course context.

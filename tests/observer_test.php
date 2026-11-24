@@ -251,4 +251,128 @@ final class observer_test extends \advanced_testcase {
             'uetimemodified' => (int) $ue->timemodified,
         ]);
     }
+
+    /**
+     * Re-check tasks that are not running yet.
+     *
+     * @return \stdClass[] Their custom data.
+     */
+    protected function pending(): array {
+        global $DB;
+        $records = $DB->get_records_select(
+            'task_adhoc',
+            'classname = :classname AND timestarted IS NULL',
+            ['classname' => '\\' . recheck_user::class],
+            'id ASC'
+        );
+        return array_values(array_map(fn($r) => json_decode($r->customdata), $records));
+    }
+
+    public function test_an_event_during_the_users_running_task_is_queued_again(): void {
+        global $DB;
+        $this->create_instance(
+            ['op' => 'and', 'children' => [['type' => 'fake', 'config' => ['userids' => [-1]]]]],
+            enforceable::CHECK_EVENTS
+        );
+        $DB->delete_records('task_adhoc');
+        \core\event\user_updated::create_from_userid($this->user->id)->trigger();
+        $this->assertCount(1, $this->pending());
+
+        // Control: while that task is still pending, more events collapse into it.
+        \core\event\user_updated::create_from_userid($this->user->id)->trigger();
+        $this->assertCount(1, $this->queued());
+
+        // The task starts: an event now must not be swallowed by the running task.
+        $DB->set_field('task_adhoc', 'timestarted', time(), ['classname' => '\\' . recheck_user::class]);
+        $this->assertSame([], $this->pending());
+        for ($i = 0; $i < 3; $i++) {
+            \core\event\user_updated::create_from_userid($this->user->id)->trigger();
+        }
+        $pending = $this->pending();
+        $this->assertCount(1, $pending);
+        $this->assertSame((int) $this->user->id, (int) $pending[0]->userid);
+        $this->assertSame(0, (int) $pending[0]->depth);
+        $this->assertCount(2, $this->queued());
+    }
+
+    public function test_depth_limit_holds_in_every_slot(): void {
+        global $DB;
+        $this->assertTrue(recheck_user::queue((int) $this->user->id, recheck_user::MAX_DEPTH));
+        $DB->set_field('task_adhoc', 'timestarted', time(), ['classname' => '\\' . recheck_user::class]);
+        $this->assertTrue(recheck_user::queue((int) $this->user->id, recheck_user::MAX_DEPTH));
+        $this->assertFalse(recheck_user::queue((int) $this->user->id, recheck_user::MAX_DEPTH + 1));
+        $this->assertCount(2, $this->queued());
+        $this->assertCount(1, $this->pending());
+    }
+
+    public function test_events_during_an_upgrade_queue_nothing(): void {
+        global $CFG, $DB;
+        $this->create_instance(
+            ['op' => 'and', 'children' => [['type' => 'fake', 'config' => ['userids' => [-1]]]]],
+            enforceable::CHECK_EVENTS
+        );
+        $DB->delete_records('task_adhoc');
+        $CFG->upgraderunning = time();
+        try {
+            \core\event\user_updated::create_from_userid($this->user->id)->trigger();
+        } finally {
+            unset($CFG->upgraderunning);
+        }
+        $this->assertSame([], $this->queued());
+
+        // Control: the same event outside the upgrade queues the re-check.
+        \core\event\user_updated::create_from_userid($this->user->id)->trigger();
+        $this->assertCount(1, $this->queued());
+    }
+
+    /**
+     * Suspends the test user's enrolment through the enforcer and backdates it, as an old suspension.
+     *
+     * @param \stdClass $instance Instance whose tree the user fails.
+     * @return \stdClass The open state row.
+     */
+    protected function owned_suspension(\stdClass $instance): \stdClass {
+        global $DB;
+        $this->assertSame(enforcer::OUTCOME_SUSPENDED, (new enforcer())->check_user($instance, $this->user->id));
+        $ueid = (int) $DB->get_field('user_enrolments', 'id', ['enrolid' => $instance->id, 'userid' => $this->user->id]);
+        $DB->set_field('user_enrolments', 'timemodified', time() - 100, ['id' => $ueid]);
+        $DB->set_field(enforcer::TABLE, 'uetimemodified', time() - 100, ['userenrolmentid' => $ueid]);
+        return $DB->get_record(enforcer::TABLE, ['userenrolmentid' => $ueid], '*', MUST_EXIST);
+    }
+
+    public function test_hook_decides_ownership_on_the_recorded_facts(): void {
+        global $DB;
+        $failing = ['op' => 'and', 'children' => [['type' => 'fake', 'config' => ['userids' => [-1]]]]];
+
+        // A teacher reactivates the suspension: no longer the enforcer's.
+        $instance = $this->create_instance($failing, 0);
+        $state = $this->owned_suspension($instance);
+        $this->plugin->update_user_enrol($instance, $this->user->id, ENROL_USER_ACTIVE);
+        $this->assertSame(enforcer::CLOSE_EXTERNAL, $DB->get_field(enforcer::TABLE, 'closereason', ['id' => $state->id]));
+
+        // A teacher edits only the dates of an owned suspension: kept, stamped with the new timemodified.
+        $instance = $this->create_instance($failing, 0);
+        $state = $this->owned_suspension($instance);
+        $this->plugin->update_user_enrol($instance, $this->user->id, null, time() - 50);
+        $state = $DB->get_record(enforcer::TABLE, ['id' => $state->id], '*', MUST_EXIST);
+        $ue = $DB->get_record('user_enrolments', ['id' => $state->userenrolmentid], '*', MUST_EXIST);
+        $this->assertNull($state->timeclosed);
+        $this->assertSame((int) $ue->timemodified, (int) $state->uetimemodified);
+        $this->assertGreaterThan(time() - 100, (int) $state->uetimemodified);
+
+        // A teacher edits the dates of a suspension changed behind the hooks: not reclaimed, closed.
+        $instance = $this->create_instance($failing, 0);
+        $state = $this->owned_suspension($instance);
+        $DB->set_field('user_enrolments', 'timemodified', time() - 90, ['id' => $state->userenrolmentid]);
+        $this->plugin->update_user_enrol($instance, $this->user->id, null, time() - 50);
+        $this->assertSame(enforcer::CLOSE_EXTERNAL, $DB->get_field(enforcer::TABLE, 'closereason', ['id' => $state->id]));
+
+        // The enforcer's own write: the hook leaves its row to the enforcer, which closes it as reactivated.
+        $instance = $this->create_instance($failing, 0);
+        $state = $this->owned_suspension($instance);
+        $DB->set_field('enrol', 'customtext1', json_encode(['op' => 'and', 'children' => []]), ['id' => $instance->id]);
+        $instance = $DB->get_record('enrol', ['id' => $instance->id], '*', MUST_EXIST);
+        $this->assertSame(enforcer::OUTCOME_REACTIVATED, (new enforcer())->check_user($instance, $this->user->id));
+        $this->assertSame(enforcer::CLOSE_REACTIVATED, $DB->get_field(enforcer::TABLE, 'closereason', ['id' => $state->id]));
+    }
 }

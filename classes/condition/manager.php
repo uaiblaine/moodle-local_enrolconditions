@@ -213,6 +213,96 @@ class manager {
     }
 
     /**
+     * Instances whose stored tree uses a condition type, with their tree, through the methods' own API.
+     *
+     * Every installed method that stores condition trees counts, enabled or not, and every instance of it (one
+     * query, read as a recordset). The stored text is searched for the type as a JSON string before it is parsed,
+     * so a site with thousands of instances pays one pass over their rows and a string search each, and parses only
+     * the trees that may use the type.
+     *
+     * @param string $type Condition type.
+     * @param int|null $courseid Only the instances of this course.
+     * @return array[] ['instance' => enrol record, 'plugin' => enforceable, 'tree' => tree], by instance id; only
+     *     trees that parse and have a node of the type.
+     */
+    public static function get_trees_with_type(string $type, ?int $courseid = null): array {
+        $found = [];
+        foreach (static::read_candidates($type, $courseid) as $id => [$instance, $plugin, $json]) {
+            try {
+                $tree = tree::from_json($json);
+            } catch (\local_enrolconditions\invalid_tree_exception $e) {
+                continue;
+            }
+            if (in_array($type, $tree->get_types(), true)) {
+                $found[$id] = ['instance' => $instance, 'plugin' => $plugin, 'tree' => $tree];
+            }
+        }
+        return $found;
+    }
+
+    /**
+     * Instances whose stored value names a condition type but is not a valid tree, with the value decoded.
+     *
+     * A restore keeps a tree that does not validate (it evaluates to unknown until a teacher fixes it), and it
+     * keeps the names a list of usernames holds. The privacy providers read those lists from the decoded value,
+     * since {@see tree::from_json()} refuses it. A value that is not JSON holds no list and is not returned.
+     *
+     * @param string $type Condition type.
+     * @param int|null $courseid Only the instances of this course.
+     * @return array[] ['instance' => enrol record, 'plugin' => enforceable, 'data' => decoded JSON (objects as
+     *     stdClass)], by instance id.
+     */
+    public static function get_invalid_trees_with_type(string $type, ?int $courseid = null): array {
+        $found = [];
+        foreach (static::read_candidates($type, $courseid) as $id => [$instance, $plugin, $json]) {
+            try {
+                tree::from_json($json);
+                continue;
+            } catch (\local_enrolconditions\invalid_tree_exception $e) {
+                $data = json_decode($json);
+            }
+            if (is_object($data) || is_array($data)) {
+                $found[$id] = ['instance' => $instance, 'plugin' => $plugin, 'data' => $data];
+            }
+        }
+        return $found;
+    }
+
+    /**
+     * Stored values of the instances of the methods that store trees, that name a condition type.
+     *
+     * One query, read as a recordset; the text is searched for the type as a JSON string before anything parses it.
+     *
+     * @param string $type Condition type.
+     * @param int|null $courseid Only the instances of this course.
+     * @return array[] [enrol record, enforceable, stored text], by instance id.
+     */
+    protected static function read_candidates(string $type, ?int $courseid): array {
+        global $DB;
+        $plugins = static::get_enforceable_plugins();
+        if (!$plugins) {
+            return [];
+        }
+        [$insql, $params] = $DB->get_in_or_equal(array_map('strval', array_keys($plugins)), SQL_PARAMS_NAMED);
+        $where = "enrol $insql";
+        if ($courseid !== null) {
+            $where .= ' AND courseid = :courseid';
+            $params['courseid'] = $courseid;
+        }
+        $needle = json_encode($type);
+        $candidates = [];
+        $rs = $DB->get_recordset_select('enrol', $where, $params, 'id');
+        foreach ($rs as $instance) {
+            $json = $plugins[$instance->enrol]->get_enforcement_tree($instance);
+            if ($json !== null && str_contains($json, $needle)) {
+                $candidates[(int) $instance->id] = [$instance, $plugins[$instance->enrol], $json];
+            }
+        }
+        $rs->close();
+        return $candidates;
+    }
+
+    /**
      * Condition class of an installed enrolcond subplugin.
      *
      * @param string $type Subplugin name without the enrolcond_ prefix.

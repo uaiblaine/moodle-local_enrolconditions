@@ -119,16 +119,21 @@ class queries {
     }
 
     /**
-     * Runs a query.
+     * Runs a query. Refuses while a transaction is open.
      *
      * @param string $sql
      * @param int $courseid
      * @param int $limit 0 for all rows.
      * @return bool[] Usernames in lower case, as keys.
-     * @throws \moodle_exception When the text is not acceptable or the query fails.
+     * @throws \moodle_exception When the text is not acceptable, the query fails or a transaction is open.
      */
     public static function run(string $sql, int $courseid, int $limit = 0): array {
         global $DB;
+        // The one place that refuses to run the admin's SQL inside the caller's transaction: every path that runs it
+        // ends here, and a failing query would abort that transaction (for example, an event observer's).
+        if ($DB->is_transaction_started()) {
+            throw new \moodle_exception('errortransaction', self::COMPONENT);
+        }
         $error = self::check_text($sql);
         if ($error !== null) {
             throw new \moodle_exception('errorquery', self::COMPONENT, '', $error);
@@ -183,7 +188,7 @@ class queries {
             return self::$results[$cachekey];
         }
         $ttl = (int) get_config(self::COMPONENT, 'cachettl');
-        $usernames = $ttl > 0 ? self::get_cached($sql, $courseid, $cachekey, $ttl) : self::run_outside_transaction($sql, $courseid);
+        $usernames = $ttl > 0 ? self::get_cached($sql, $courseid, $cachekey, $ttl) : self::run($sql, $courseid);
         self::$results = [$cachekey => $usernames] + array_slice(self::$results, 0, 9, true);
         return $usernames;
     }
@@ -205,12 +210,9 @@ class queries {
         if ($cached !== false && $cached['time'] > time() - $ttl) {
             return $cached['usernames'];
         }
-        if ($DB->is_transaction_started()) {
-            // A failing query would abort the transaction of the caller (for example, an event observer).
-            if ($cached !== false) {
-                return $cached['usernames'];
-            }
-            throw new \moodle_exception('errortransaction', self::COMPONENT);
+        if ($cached !== false && $DB->is_transaction_started()) {
+            // Not refreshed inside the caller's transaction (run() refuses it): the expired entry is served.
+            return $cached['usernames'];
         }
 
         $factory = \core\lock\lock_config::get_lock_factory(self::COMPONENT);
@@ -241,23 +243,6 @@ class queries {
         } finally {
             $lock->release();
         }
-    }
-
-    /**
-     * Runs a query unless a transaction is open.
-     *
-     * @param string $sql
-     * @param int $courseid
-     * @return bool[] Usernames as keys.
-     * @throws \moodle_exception
-     */
-    protected static function run_outside_transaction(string $sql, int $courseid): array {
-        global $DB;
-        if ($DB->is_transaction_started()) {
-            // A failing query would abort the transaction of the caller (for example, an event observer).
-            throw new \moodle_exception('errortransaction', self::COMPONENT);
-        }
-        return self::run($sql, $courseid);
     }
 
     /**

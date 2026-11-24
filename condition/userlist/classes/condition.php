@@ -41,7 +41,8 @@ class condition extends \local_enrolconditions\condition\base {
     public function is_met(int $userid, stdClass $instance, array $config): bool {
         $list = $config['usernames'] ?? [];
         if (!is_array($list) || !$list) {
-            // Only a restore from another site leaves the list empty: unknown until a teacher types one.
+            // An empty list cannot be evaluated: unknown, never "nobody listed" and never "everybody". It is empty
+            // after a restore from another site and after a privacy erasure, until a teacher types a list.
             throw new \moodle_exception('emptylist', 'enrolcond_userlist');
         }
         $user = \core_user::get_user($userid, 'id, username');

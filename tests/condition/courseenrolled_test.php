@@ -175,6 +175,15 @@ final class courseenrolled_test extends \advanced_testcase {
         $this->assertNull($this->tree_value($restored, (int) $user->id, true));
         $this->assertNull($this->tree_value(['courseids' => [0]], (int) $user->id));
         $this->assertNull($this->tree_value([], (int) $user->id));
+        // The condition itself answers "unknown" for the empty list, not by an accident of the query.
+        foreach ([$restored, ['courseids' => [0]], []] as $config) {
+            try {
+                (new condition())->is_met((int) $user->id, (object) ['id' => 0, 'courseid' => SITEID], $config);
+                $this->fail('The empty list must be unknown');
+            } catch (\moodle_exception $e) {
+                $this->assertSame('missingcourse', $e->errorcode);
+            }
+        }
         // Control: the same site keeps the ids, which evaluate.
         $kept = (new condition())->restore_config(['courseids' => [(int) $course->id]], true);
         $this->assertFalse($this->tree_value($kept, (int) $user->id));

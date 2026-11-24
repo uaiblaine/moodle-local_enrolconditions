@@ -165,17 +165,19 @@ class observer {
     /**
      * Someone else is about to change an enrolment suspended by the enforcer.
      *
-     * The record still has the previous timemodified here, and already the new status. The enforcer keeps the
-     * suspension only when it still owned it and the enrolment stays suspended (for example, only its dates change).
+     * The record still has the previous timemodified here, and already the new status: exactly the two facts
+     * enforcer::suspension_still_owned() decides on. The enforcer keeps the suspension only when it still owned it
+     * and the enrolment stays suspended (for example, only its dates change).
      *
-     * When the enforcer itself is writing, core dispatches this hook only because it is about to change the row:
-     * that is the fact the enforcer records its state on (enforcer::record_applied()).
+     * When the enforcer itself is writing this row, core dispatches this hook only because it is about to change
+     * it: that is the fact the enforcer records its state on (enforcer::record_applied()). Another row written
+     * meanwhile (by an observer of another plugin, inside the enforcer's write) is someone else's change.
      *
      * @param \core_enrol\hook\before_user_enrolment_updated $hook
      */
     public static function before_user_enrolment_updated(\core_enrol\hook\before_user_enrolment_updated $hook): void {
         $ue = $hook->userenrolmentinstance;
-        if (enforcer::is_acting()) {
+        if (enforcer::is_acting_on((int) $ue->id)) {
             enforcer::record_applied($ue);
             return;
         }
@@ -184,8 +186,7 @@ class observer {
         }
         unset(self::$keep[(int) $ue->id]);
         foreach (self::open_suspensions((int) $ue->id) as $state) {
-            $stillowned = (int) $ue->status === ENROL_USER_SUSPENDED
-                && (int) $ue->timemodified === (int) $state->uetimemodified;
+            $stillowned = enforcer::suspension_still_owned($state, (int) $ue->status, (int) $ue->timemodified);
             if ($stillowned) {
                 self::$keep[(int) $ue->id] = (int) $state->id;
             } else {
@@ -204,10 +205,10 @@ class observer {
      */
     public static function user_enrolment_updated(\core\event\user_enrolment_updated $event): void {
         global $DB;
-        if (enforcer::is_acting() || !self::is_enforceable((string) ($event->other['enrol'] ?? ''))) {
+        $ueid = (int) $event->objectid;
+        if (enforcer::is_acting_on($ueid) || !self::is_enforceable((string) ($event->other['enrol'] ?? ''))) {
             return;
         }
-        $ueid = (int) $event->objectid;
         $keep = self::$keep[$ueid] ?? null;
         unset(self::$keep[$ueid]);
         $ue = $DB->get_record('user_enrolments', ['id' => $ueid]);

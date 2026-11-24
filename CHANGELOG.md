@@ -2,6 +2,30 @@
 
 All notable changes to the Enrolment conditions plugin will be documented in this file.
 
+## 1.2.0+uai.2 - 2026-11-23
+
+### Security
+- Reach rule: the editor never names more courses than it checked (a list over 50 courses is refused with *Choose at most 50 courses*), a missing course or cohort and one the user may not reference get the same `noaccess` answer on every door for a new or changed node (the reach check runs before the validation of the configuration, so the editor is no existence oracle), a stored node whose record is gone still gets `missingcourse` or `missingcohort`, and a course reachable only through an enrolment must be visible to the user, as core's course selector requires.
+- The summary of a new node is built only from a valid configuration.
+- `enrolcond_userfile`: a new node may reference only a file its own user uploaded through the dialog and that no stored tree uses.
+- `enrolcond_userlist`: listed users are found, exported and erased by the privacy provider (a deleted account too, through the md5 core keeps of the username). The erasure writes the tree back through the new optional interface `\local_enrolconditions\tree_writer`, which an enrolment method implements to let the engine erase usernames from its stored trees; a method without it keeps its trees as they are.
+
+### Changed
+- `enrolcond_userlist` privacy: a stored value that is valid JSON but not a valid tree (a restore keeps one) is searched and erased by walking the decoded value, and `manager::get_invalid_trees_with_type()` returns such values; `enrolcond_userfile` matches names through the shared `usernames::names_any()`. An empty list of usernames is documented as unknown. `enforcer::is_acting()` is removed (use `is_acting_on()`).
+- The enforcer reads the instance again under the lock, so a tree, action or status a teacher changed during a periodic run is respected, and a deleted or disabled instance acts on nobody.
+- The enforcer records only its own write of the row it acts on, and stays correct when another plugin writes an enrolment, or runs the enforcer, inside that write.
+- Ownership of a suspension has one definition, shared with the hook.
+- The periodic task logs the count of each outcome and how many enrolments could not be checked.
+- File clean-up of `enrolcond_userfile` reads the references again before each deletion and forgets the cached list of a deleted file.
+- `enrolcond_cohort`, `enrolcond_coursecompleted`, `enrolcond_courseenrolled`, `enrolcond_userfile` and `enrolcond_userlist` require `local_enrolconditions` 2026112301.
+
+### Fixed
+- An event for a user whose re-check task is already running is queued again (a slot in the task data), so core's de-duplication no longer loses it.
+
+### Added
+- `\local_enrolconditions\tree_writer`, the optional interface through which the engine writes a method's condition tree back to erase usernames; it never validates for the current user.
+- Tests for sixteen guards that no test held, and a mutation spec (`mutations/`, kept out of the package).
+
 ## 1.2.0+uai.1 - 2026-11-23
 
 ### Added

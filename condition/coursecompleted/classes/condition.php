@@ -77,14 +77,19 @@ class condition extends base {
     public function validate_config(array $config): array {
         global $DB;
         $courseid = (int) ($config['courseid'] ?? 0);
-        if ($courseid <= 0 || $courseid == SITEID || !$DB->record_exists('course', ['id' => $courseid])) {
+        if ($courseid <= 0 || $courseid == SITEID) {
             return ['courseid' => get_string('invalidcourse', 'enrolcond_coursecompleted')];
+        }
+        if (!$DB->record_exists('course', ['id' => $courseid])) {
+            // Reached only for a node stored unchanged (or without a reach check): a new one is refused before.
+            return ['courseid' => get_string('missingcourse', 'enrolcond_coursecompleted')];
         }
         return [];
     }
 
     /**
-     * The course must be one the user may name ({@see base::can_reference_course()}).
+     * The course must be one the user may name ({@see base::can_reference_course()}); a course that does not exist
+     * gets the same answer as one out of reach.
      *
      * @param array $config
      * @param \context $context Course context.

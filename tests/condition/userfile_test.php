@@ -201,12 +201,151 @@ final class userfile_test extends \core_privacy\tests\provider_testcase {
             [condition::COMPONENT, $recent['fileid']]
         );
 
+        $context = \context_course::instance($course->id);
+        $unusedhash = condition::get_file($unused, $context)->get_contenthash();
+        // Another test may have read the same content in this process: start from an empty memory.
+        condition::forget_usernames($unusedhash);
+        condition::get_usernames(condition::get_file($unused, $context));
+        $this->assertNotFalse(\cache::make(condition::COMPONENT, 'usernames')->get($unusedhash));
+
+        $this->expectOutputRegex('/1 files of usernames deleted/');
+        (new \enrolcond_userfile\task\cleanup_files())->execute();
+        $this->assertNotNull(condition::get_file($used, $context));
+        $this->assertNull(condition::get_file($unused, $context));
+        $this->assertNotNull(condition::get_file($recent, $context));
+        // The list of the deleted file is gone from the shared cache too.
+        $this->assertFalse(\cache::make(condition::COMPONENT, 'usernames')->get($unusedhash));
+    }
+
+    public function test_cleanup_reads_the_references_again_before_deleting(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $first = $this->save($course, "ana\n");
+        $second = $this->save($course, "bia\n");
+        $DB->set_field('files', 'timemodified', time() - 2 * DAYSECS, ['component' => condition::COMPONENT]);
+        // A teacher saves a tree that uses the second file after the task read the references of the course.
+        $task = new class (fn() => $this->store($course, $second)) extends \enrolcond_userfile\task\cleanup_files {
+            /** @var int Calls of read_references(). */
+            public int $reads = 0;
+
+            /**
+             * Constructor.
+             *
+             * @param \Closure $save Stores the tree, as the teacher does.
+             */
+            public function __construct(
+                /** @var \Closure */
+                protected \Closure $save,
+            ) {
+            }
+
+            /**
+             * Reads the references, and stores the teacher's tree right after the first read.
+             *
+             * @param int $courseid
+             * @return bool[]
+             */
+            protected function read_references(int $courseid): array {
+                $ids = parent::read_references($courseid);
+                if (++$this->reads === 1) {
+                    ($this->save)();
+                }
+                return $ids;
+            }
+        };
+
+        $this->expectOutputRegex('/1 files of usernames deleted/');
+        $task->execute();
+        $context = \context_course::instance($course->id);
+        $this->assertNotNull(condition::get_file($second, $context));
+        // Control: the file no tree uses was deleted.
+        $this->assertNull(condition::get_file($first, $context));
+    }
+
+    public function test_cleanup_keeps_a_file_only_a_disabled_instance_uses(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $used = $this->save($course, "ana\n");
+        $unused = $this->save($course, "bia\n");
+        $this->store($course, $used);
+        $DB->set_field('enrol', 'status', ENROL_INSTANCE_DISABLED, ['courseid' => $course->id, 'enrol' => 'manual']);
+        $DB->set_field('files', 'timemodified', time() - 2 * DAYSECS, ['component' => condition::COMPONENT]);
+
         $this->expectOutputRegex('/1 files of usernames deleted/');
         (new \enrolcond_userfile\task\cleanup_files())->execute();
         $context = \context_course::instance($course->id);
         $this->assertNotNull(condition::get_file($used, $context));
+        // Control: the file no instance uses goes.
         $this->assertNull(condition::get_file($unused, $context));
-        $this->assertNotNull(condition::get_file($recent, $context));
+    }
+
+    public function test_check_access_refuses_a_file_another_teacher_uploaded(): void {
+        $this->resetAfterTest();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $context = \context_course::instance($course->id);
+        $uploader = $this->getDataGenerator()->create_and_enrol($course, 'editingteacher');
+        $other = $this->getDataGenerator()->create_and_enrol($course, 'editingteacher');
+        $condition = new condition();
+
+        // The dialog stored the file for its uploader; no tree uses it yet.
+        $this->setUser($uploader);
+        $config = $this->save($course, "ana\n");
+        $this->assertSame((int) $uploader->id, (int) condition::get_file($config, $context)->get_userid());
+
+        $this->setUser($other);
+        $this->assertSame(get_string('noaccess', condition::COMPONENT), $condition->check_access($config, $context));
+        // Control: its uploader may reference it.
+        $this->setUser($uploader);
+        $this->assertNull($condition->check_access($config, $context));
+    }
+
+    public function test_check_access_refuses_a_context_that_is_not_a_course(): void {
+        global $USER;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $category = $this->getDataGenerator()->create_category();
+        $catcontext = \context_coursecat::instance($category->id);
+        // A file of this component in a category context, uploaded by this user and used by no tree.
+        get_file_storage()->create_file_from_string([
+            'contextid' => $catcontext->id,
+            'component' => condition::COMPONENT,
+            'filearea' => condition::FILEAREA,
+            'itemid' => 55,
+            'filepath' => '/',
+            'filename' => 'list.csv',
+            'userid' => $USER->id,
+        ], "ana\n");
+        $config = ['fileid' => 55, 'filename' => 'list.csv', 'count' => 1];
+        $condition = new condition();
+
+        $this->assertSame(get_string('noaccess', condition::COMPONENT), $condition->check_access($config, $catcontext));
+        // Control: the same kind of file in a course is accepted.
+        $course = $this->getDataGenerator()->create_course();
+        $this->assertNull($condition->check_access($this->save($course, "ana\n"), \context_course::instance($course->id)));
+    }
+
+    public function test_privacy_delete_of_a_context_forgets_the_cached_lists(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $course = $this->getDataGenerator()->create_course();
+        $context = \context_course::instance($course->id);
+        $config = $this->save($course, "ana\nbia\n");
+        $hash = condition::get_file($config, $context)->get_contenthash();
+        condition::forget_usernames($hash);
+        condition::get_usernames(condition::get_file($config, $context));
+        $cache = \cache::make(condition::COMPONENT, 'usernames');
+        $this->assertNotFalse($cache->get($hash));
+
+        provider::delete_data_for_all_users_in_context($context);
+        $this->assertNull(condition::get_file($config, $context));
+        $this->assertFalse($cache->get($hash));
     }
 
     public function test_check_access_refuses_a_file_another_tree_uses(): void {

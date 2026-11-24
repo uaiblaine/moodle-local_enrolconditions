@@ -148,7 +148,7 @@ class condition_config extends \core_form\dynamic_form {
         $mform->addElement('hidden', self::FIELD_INSTANCE);
         $mform->setType(self::FIELD_INSTANCE, PARAM_INT);
         // Shows the error of a configuration the user may not reference; empty otherwise.
-        $mform->addElement('static', 'enrolcondaccess', '');
+        $mform->addElement('static', editor_access::ACCESS_FIELD, '');
 
         $this->get_condition()->config_form_definition($mform);
     }
@@ -157,14 +157,16 @@ class condition_config extends \core_form\dynamic_form {
     public function validation($data, $files): array {
         $errors = parent::validation($data, $files);
         $condition = $this->get_condition();
-        $errors = array_merge($errors, $condition->config_form_validation($data, $files));
-        if (!$errors) {
-            $error = $this->check_node($condition, $condition->config_from_form_data((object) $data));
-            if ($error !== null) {
-                $errors['enrolcondaccess'] = $error;
-            }
-        }
-        return $errors;
+        // The reach check answers first, as on the save of a tree: a missing record and one out of reach get the
+        // same answer ({@see editor_access::validate_node()}).
+        return array_merge($errors, editor_access::validate_node(
+            $condition,
+            $condition->get_type(),
+            $condition->config_from_form_data((object) $data),
+            $this->get_context_for_dynamic_submission(),
+            $this->get_stored_keys(),
+            fn(): array => $condition->config_form_validation($data, $files)
+        ));
     }
 
     #[\Override]

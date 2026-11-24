@@ -26,7 +26,12 @@ use local_enrolconditions\observer;
  * Queued by observer::any_event() when an event observed by the conditions happens, so the request that raised
  * the event evaluates and writes nothing. Identical pending requests (same user, same depth) collapse into one.
  * Events raised while the task works queue the next task one level deeper; beyond MAX_DEPTH nothing more is
- * queued, which bounds instances whose conditions keep changing each other. Custom data: userid, depth.
+ * queued, which bounds instances whose conditions keep changing each other. Custom data: userid, depth, slot.
+ *
+ * The slot keeps an event from being lost while the user's task runs: core's duplicate check matches a task of the
+ * same identity that is already running, so an event that arrives after the task read the enrolments would queue
+ * nothing. queue() takes the first slot whose task is not running, so a pending task still absorbs every new event
+ * and a running one never does.
  *
  * @package    local_enrolconditions
  * @copyright  2026 Anderson Blaine
@@ -36,8 +41,14 @@ class recheck_user extends \core\task\adhoc_task {
     /** @var int Deepest task queued from the events of another task; the first one has depth 0. */
     public const MAX_DEPTH = 5;
 
+    /** @var int Tasks of one user and depth that may exist at once, running or pending, one per slot. */
+    public const SLOTS = 3;
+
     /**
      * Queues a re-check of a user, unless an identical one is pending.
+     *
+     * When every slot runs a task at once (three workers re-checking one user), the event is left to the last
+     * slot's running task; the login and periodic checks still see the change.
      *
      * @param int $userid
      * @param int $depth 0 for an event outside a re-check; the running task's depth plus one inside one.
@@ -47,11 +58,34 @@ class recheck_user extends \core\task\adhoc_task {
         if ($depth > self::MAX_DEPTH) {
             return false;
         }
-        $task = new self();
-        $task->set_component('local_enrolconditions');
-        $task->set_custom_data(['userid' => $userid, 'depth' => max(0, $depth)]);
+        for ($slot = 0; $slot < self::SLOTS; $slot++) {
+            $task = new self();
+            $task->set_component('local_enrolconditions');
+            $task->set_custom_data(['userid' => $userid, 'depth' => max(0, $depth), 'slot' => $slot]);
+            if (!self::is_running($task)) {
+                break;
+            }
+        }
         \core\task\manager::queue_adhoc_task($task, true);
         return true;
+    }
+
+    /**
+     * Whether a task of the same identity (class and custom data) is running now.
+     *
+     * @param self $task
+     * @return bool
+     */
+    protected static function is_running(self $task): bool {
+        global $DB;
+        $record = \core\task\manager::record_from_adhoc_task($task);
+        return $DB->record_exists_select(
+            'task_adhoc',
+            'classname = :classname AND component = :component AND '
+                . $DB->sql_compare_text('customdata', \core_text::strlen($record->customdata) + 1) . ' = :customdata'
+                . ' AND timestarted IS NOT NULL',
+            ['classname' => $record->classname, 'component' => $record->component, 'customdata' => $record->customdata]
+        );
     }
 
     #[\Override]

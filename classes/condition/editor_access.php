@@ -24,19 +24,24 @@ use stdClass;
 /**
  * Who may edit a condition tree, and which nodes of a tree the current user may reference.
  *
- * Two rules, each the only copy of itself:
+ * Three rules, each the only copy of itself:
  * - require_editor_access(): the configuration dialog of a condition is opened from the instance form of an
  *   enrolment method that stores condition trees; it asks what that form asks (the method's config capability).
  * - check_node(): a condition node the user adds or changes must pass base::check_access() for them; a node
  *   already stored unchanged in the instance is never asked again, so a tree an administrator wrote stays
  *   editable. The dialog, the tree editor and the save of a tree ({@see \local_enrolconditions\tree::validate()})
  *   all decide through it.
+ * - validate_node(): the errors of a node, the reach check first, so a record that does not exist and one the user
+ *   may not reference get the same answer on every door (the dialog and the save of a tree).
  *
  * @package    local_enrolconditions
  * @copyright  2026 Anderson Blaine
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 class editor_access {
+    /** @var string Field of the configuration dialog that shows the reach error. */
+    public const ACCESS_FIELD = 'enrolcondaccess';
+
     /**
      * Checks that the current user may edit the condition tree of an enrolment instance in a course.
      *
@@ -100,20 +105,28 @@ class editor_access {
      * @param string $type
      * @param array $config
      * @return string
+     * @throws \JsonException When the configuration cannot be encoded (invalid UTF-8, a non-finite number): such a
+     *     node has no key, so it is never a stored node.
      */
     public static function node_key(string $type, array $config): string {
-        return sha1($type . "\n" . json_encode(self::sorted($config)));
+        return sha1($type . "\n" . json_encode(self::sorted($config), JSON_THROW_ON_ERROR));
     }
 
     /**
      * Keys of every condition node of a tree.
+     *
+     * A node whose configuration cannot be encoded has no key and is left out: it is never "stored unchanged".
      *
      * @param array $node Root group, as \local_enrolconditions\tree::to_array() returns it.
      * @return bool[] Keys are node_key() values.
      */
     public static function get_node_keys(array $node): array {
         if (isset($node['type'])) {
-            return [self::node_key((string) $node['type'], (array) ($node['config'] ?? [])) => true];
+            try {
+                return [self::node_key((string) $node['type'], (array) ($node['config'] ?? [])) => true];
+            } catch (\JsonException $e) {
+                return [];
+            }
         }
         $keys = [];
         foreach ($node['children'] ?? [] as $child) {
@@ -133,11 +146,50 @@ class editor_access {
      *     (the tree validation refuses that on its own) or its condition allows it.
      */
     public static function check_node(string $type, array $config, context $context, array $storedkeys): ?string {
-        if (isset($storedkeys[self::node_key($type, $config)])) {
+        try {
+            $key = self::node_key($type, $config);
+        } catch (\JsonException $e) {
+            // Not stored (it has no key) and not allowed: no condition can describe what it names.
+            return get_string('editornotavailable', 'local_enrolconditions');
+        }
+        if (isset($storedkeys[$key])) {
             return null;
         }
         $condition = manager::get_condition($type);
         return $condition ? $condition->check_access($config, $context) : null;
+    }
+
+    /**
+     * Errors of a condition node a user saves, the reach check before the validation of the configuration.
+     *
+     * For a node that is new or changed, the reach check answers first: base::check_access() refuses a record that
+     * does not exist with the same text as one the user may not reference, so the validation (which names a
+     * missing record precisely) never tells the two apart for ids the user typed. A node stored unchanged passes
+     * the reach check and gets the precise validation, so a teacher learns that a record of a stored tree is gone.
+     *
+     * @param base $condition
+     * @param string $type Type of the node.
+     * @param array $config
+     * @param context|null $context Course context of the instance; null skips the reach check.
+     * @param array $storedkeys get_node_keys() of the tree stored in the instance.
+     * @param callable|null $validate Returns the validation errors keyed by field; defaults to validate_config().
+     * @return array<string, string> Errors keyed by form field; the reach error under ACCESS_FIELD; empty when valid.
+     */
+    public static function validate_node(
+        base $condition,
+        string $type,
+        array $config,
+        ?context $context,
+        array $storedkeys,
+        ?callable $validate = null
+    ): array {
+        if ($context !== null) {
+            $denied = self::check_node($type, $config, $context, $storedkeys);
+            if ($denied !== null) {
+                return [self::ACCESS_FIELD => $denied];
+            }
+        }
+        return $validate ? $validate() : $condition->validate_config($config);
     }
 
     /**

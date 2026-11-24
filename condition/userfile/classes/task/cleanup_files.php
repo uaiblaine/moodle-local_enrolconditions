@@ -23,7 +23,9 @@ use local_enrolconditions\condition\manager;
  * Deletes files of usernames that no condition refers to any more.
  *
  * They are left behind when a condition is removed, or when its form is saved but the enrolment method is not.
- * Files younger than a day are kept, so forms still open are not affected.
+ * Files younger than a day are kept, so forms still open are not affected. The references of a course are read
+ * once for the run and again right before each deletion, since a teacher may save a tree that uses the file
+ * meanwhile; the cached list of usernames of a deleted file is dropped on every node.
  *
  * @package    enrolcond_userfile
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
@@ -70,6 +72,16 @@ class cleanup_files extends \core\task\scheduled_task {
         }
     }
 
+    /**
+     * File ids the stored trees of a course refer to, read now.
+     *
+     * @param int $courseid
+     * @return bool[] Keys are the file ids.
+     */
+    protected function read_references(int $courseid): array {
+        return self::get_referenced_fileids($courseid);
+    }
+
     #[\Override]
     public function execute() {
         global $DB;
@@ -78,7 +90,8 @@ class cleanup_files extends \core\task\scheduled_task {
                FROM {files} f
                JOIN {context} ctx ON ctx.id = f.contextid AND ctx.contextlevel = :level
               WHERE f.component = :component AND f.filearea = :filearea AND f.filename <> '.'
-                AND f.timemodified < :before",
+                AND f.timemodified < :before
+           ORDER BY f.id",
             ['level' => CONTEXT_COURSE, 'component' => condition::COMPONENT, 'filearea' => condition::FILEAREA,
                 'before' => time() - DAYSECS]
         );
@@ -86,9 +99,21 @@ class cleanup_files extends \core\task\scheduled_task {
         $fs = get_file_storage();
         $deleted = 0;
         foreach ($records as $record) {
-            $referenced[$record->courseid] ??= self::get_referenced_fileids((int) $record->courseid);
-            if (!isset($referenced[$record->courseid][(int) $record->itemid])) {
-                $fs->get_file_by_id($record->id)?->delete();
+            $courseid = (int) $record->courseid;
+            $referenced[$courseid] ??= $this->read_references($courseid);
+            if (isset($referenced[$courseid][(int) $record->itemid])) {
+                continue;
+            }
+            // The list was read before this file's turn: a tree saved meanwhile may use it now.
+            $referenced[$courseid] = $this->read_references($courseid);
+            if (isset($referenced[$courseid][(int) $record->itemid])) {
+                continue;
+            }
+            $file = $fs->get_file_by_id($record->id);
+            if ($file) {
+                $hash = $file->get_contenthash();
+                $file->delete();
+                condition::forget_usernames($hash);
                 $deleted++;
             }
         }
