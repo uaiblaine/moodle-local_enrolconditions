@@ -41,6 +41,7 @@ $string['file_help'] = 'A file with the usernames of the users who meet the cond
 A username in the file that has no account yet is accepted: that user can enrol once the account exists. For a few users, the "List of usernames" condition is quicker.';
 $string['filemissing'] = 'The file of usernames of this condition no longer exists.';
 $string['invalidusernames'] = 'These are not valid usernames: {$a}';
+$string['noaccess'] = 'You cannot use this file here. Upload the file of usernames again.';
 $string['pluginname'] = 'File of usernames';
 $string['privacy:metadata:core_files'] = 'Files of usernames uploaded by teachers, which list the users who meet the condition.';
 $string['toomany'] = 'A file can have at most {$a} usernames.';

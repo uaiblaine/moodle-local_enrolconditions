@@ -41,6 +41,7 @@ $string['file_help'] = 'Um arquivo com os nomes de usuário dos usuários que at
 Um nome de usuário no arquivo que ainda não tem conta é aceito: esse usuário pode se inscrever quando a conta existir. Para poucos usuários, a condição "Lista de nomes de usuário" é mais rápida.';
 $string['filemissing'] = 'O arquivo de nomes de usuário desta condição não existe mais.';
 $string['invalidusernames'] = 'Estes não são nomes de usuário válidos: {$a}';
+$string['noaccess'] = 'Você não pode usar este arquivo aqui. Envie o arquivo de nomes de usuário novamente.';
 $string['pluginname'] = 'Arquivo de nomes de usuário';
 $string['privacy:metadata:core_files'] = 'Arquivos de nomes de usuário enviados pelos professores, que listam os usuários que atendem à condição.';
 $string['toomany'] = 'Um arquivo pode ter no máximo {$a} nomes de usuário.';
