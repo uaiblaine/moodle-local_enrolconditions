@@ -25,13 +25,13 @@
 defined('MOODLE_INTERNAL') || die();
 
 $definitions = [
-    // Events observed by the instances that re-check on events. Purged when an instance changes;
-    // the time to live covers condition types and enrolment methods enabled or disabled since.
+    // Events observed by the instances that re-check on events. Purged when an instance of an enforceable
+    // method changes and when a condition type is enabled or disabled; the time to live is a backstop.
+    // No static acceleration: observer::any_event() keeps its own copy per request, and a long cron
+    // process must see a purge made on another node.
     'observedevents' => [
         'mode' => cache_store::MODE_APPLICATION,
         'simplekeys' => true,
-        'staticacceleration' => true,
-        'staticaccelerationsize' => 2,
         'ttl' => 3600,
     ],
 ];

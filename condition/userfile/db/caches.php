@@ -25,9 +25,11 @@
 defined('MOODLE_INTERNAL') || die();
 
 $definitions = [
-    // Usernames of a file, by its content hash: never stale, since a new content has a new hash.
+    // Usernames of a file, by its content hash: never stale, since a new content has a new hash. The privacy
+    // provider deletes the key of a content it rewrites; the time to live evicts the lists of deleted files.
     'usernames' => [
         'mode' => cache_store::MODE_APPLICATION,
         'simplekeys' => true,
+        'ttl' => 86400,
     ],
 ];

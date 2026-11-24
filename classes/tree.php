@@ -16,6 +16,7 @@
 
 namespace local_enrolconditions;
 
+use local_enrolconditions\condition\editor_access;
 use local_enrolconditions\condition\manager;
 use stdClass;
 
@@ -29,10 +30,10 @@ use stdClass;
  * An empty root group (or no tree at all) has no conditions and is always met.
  *
  * The evaluation uses three values: true, false and null (unknown). A condition whose type is no
- * longer installed is unknown. AND is false if any child is false, otherwise unknown if any child
- * is unknown; OR is true if any child is true, otherwise unknown if any child is unknown; NOT keeps
- * unknown as unknown. Callers decide what unknown means: enrol_conditional refuses new enrolments
- * and takes no action on existing ones.
+ * longer installed or is disabled is unknown, and so is one whose check throws. AND is false if any
+ * child is false, otherwise unknown if any child is unknown; OR is true if any child is true,
+ * otherwise unknown if any child is unknown; NOT keeps unknown as unknown. Callers decide what
+ * unknown means: enrol_conditional refuses new enrolments and takes no action on existing ones.
  *
  * @package    local_enrolconditions
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
@@ -182,12 +183,23 @@ class tree {
      * tree saved before) are accepted even when disabled or not installed, so an existing tree can
      * still be saved; their configuration is only validated when the type is installed.
      *
+     * With a context, every condition that is not stored unchanged in $previous (same type and
+     * configuration, wherever it sits in the tree, see {@see editor_access::check_node()}, the one definition of
+     * that rule) is first asked base::check_access(): whether the user saving the tree may reference what its
+     * configuration names; only when it may is its configuration validated, so a missing record and one out of
+     * reach get the same answer ({@see editor_access::validate_node()}). A condition already stored is not asked
+     * again, so a teacher can edit a tree in which somebody else wrote a condition the teacher could not have
+     * written, and learns precisely when a record it names is gone.
+     *
      * @param string[] $allowedtypes Types accepted even when not enabled.
+     * @param \context|null $context Course context of the enrolment instance; null skips the access check.
+     * @param tree|null $previous Tree stored before this one; null when there is none.
      * @return string[] Error messages; empty when valid.
      */
-    public function validate(array $allowedtypes = []): array {
+    public function validate(array $allowedtypes = [], ?\context $context = null, ?tree $previous = null): array {
         $errors = [];
-        self::walk($this->root, function (array $node, string $path) use (&$errors, $allowedtypes): void {
+        $stored = $previous ? editor_access::get_node_keys($previous->to_array()) : [];
+        self::walk($this->root, function (array $node) use (&$errors, $allowedtypes, $context, $stored): void {
             if (!isset($node['type'])) {
                 return;
             }
@@ -198,14 +210,16 @@ class tree {
                 $errors[] = get_string('treeunknowntype', 'local_enrolconditions', $type);
                 return;
             }
-            if ($condition) {
-                foreach ($condition->validate_config($node['config']) as $message) {
-                    $errors[] = get_string(
-                        'treeconditionerror',
-                        'local_enrolconditions',
-                        ['name' => $condition->get_name(), 'error' => $message]
-                    );
-                }
+            if (!$condition) {
+                return;
+            }
+            $messages = editor_access::validate_node($condition, $type, $node['config'], $context, $stored);
+            foreach ($messages as $message) {
+                $errors[] = get_string(
+                    'treeconditionerror',
+                    'local_enrolconditions',
+                    ['name' => $condition->get_name(), 'error' => $message]
+                );
             }
         });
         return $errors;
@@ -214,14 +228,59 @@ class tree {
     /**
      * Evaluates the tree for a user.
      *
+     * Without explanations the evaluation stops at the first child that decides a group (false in
+     * AND, true in OR) and the result has no failures; the value is the same three-valued result.
+     * Callers that show the failures to a user ask for the explanations.
+     *
      * @param int $userid
      * @param stdClass $instance Enrolment instance passed to the conditions.
+     * @param bool $explain Whether to build the explanation of what is not met.
      * @return tree_result
      */
-    public function evaluate(int $userid, stdClass $instance): tree_result {
+    public function evaluate(int $userid, stdClass $instance, bool $explain = true): tree_result {
+        $enabled = array_fill_keys(manager::get_enabled_types(), true);
+        if (!$explain) {
+            return new tree_result($this->value_of_node($this->root, $userid, $instance, $enabled), []);
+        }
         $failures = [];
-        $met = $this->evaluate_node($this->root, $userid, $instance, $failures);
+        $met = $this->evaluate_node($this->root, $userid, $instance, $failures, $enabled);
         return new tree_result($met, $failures);
+    }
+
+    /**
+     * Value of a node, without explanations, stopping at the first child that decides its group.
+     *
+     * @param array $node
+     * @param int $userid
+     * @param stdClass $instance
+     * @param array $enabled Enabled condition types, as keys.
+     * @return bool|null True, false or null (unknown).
+     */
+    protected function value_of_node(array $node, int $userid, stdClass $instance, array $enabled): ?bool {
+        if (isset($node['type'])) {
+            return $this->condition_value($node, $userid, $instance, $enabled);
+        }
+        $value = true;
+        if ($node['children']) {
+            // The value that decides the group: false in AND, true in OR. Unknown children only matter
+            // when no child decides.
+            $decisive = $node['op'] === self::OP_OR;
+            $value = !$decisive;
+            foreach ($node['children'] as $child) {
+                $childvalue = $this->value_of_node($child, $userid, $instance, $enabled);
+                if ($childvalue === $decisive) {
+                    $value = $decisive;
+                    break;
+                }
+                if ($childvalue === null) {
+                    $value = null;
+                }
+            }
+        }
+        if ($node['negate'] && $value !== null) {
+            $value = !$value;
+        }
+        return $value;
     }
 
     /**
@@ -231,17 +290,18 @@ class tree {
      * @param int $userid
      * @param stdClass $instance
      * @param array $failures Receives the explanation of the node when it is not met.
+     * @param array $enabled Enabled condition types, as keys.
      * @return bool|null True, false or null (unknown).
      */
-    protected function evaluate_node(array $node, int $userid, stdClass $instance, array &$failures): ?bool {
+    protected function evaluate_node(array $node, int $userid, stdClass $instance, array &$failures, array $enabled): ?bool {
         if (isset($node['type'])) {
-            return $this->evaluate_condition($node, $userid, $instance, $failures);
+            return $this->evaluate_condition($node, $userid, $instance, $failures, $enabled);
         }
 
         $childfailures = [];
         $results = [];
         foreach ($node['children'] as $child) {
-            $results[] = $this->evaluate_node($child, $userid, $instance, $childfailures);
+            $results[] = $this->evaluate_node($child, $userid, $instance, $childfailures, $enabled);
         }
         if (!$results) {
             $value = true;
@@ -273,12 +333,44 @@ class tree {
      * @param int $userid
      * @param stdClass $instance
      * @param array $failures Receives the explanation when the condition is not met.
-     * @return bool|null Null when the type is not installed.
+     * @param array $enabled Enabled condition types, as keys.
+     * @return bool|null Null when the condition is unknown.
      */
-    protected function evaluate_condition(array $node, int $userid, stdClass $instance, array &$failures): ?bool {
+    protected function evaluate_condition(
+        array $node,
+        int $userid,
+        stdClass $instance,
+        array &$failures,
+        array $enabled
+    ): ?bool {
+        $value = $this->condition_value($node, $userid, $instance, $enabled);
+        if ($value === null) {
+            $failures[] = ['message' => get_string('failureunknown', 'local_enrolconditions'), 'children' => []];
+        } else if (!$value) {
+            $failures[] = ['message' => $this->describe($node), 'children' => []];
+        }
+        return $value;
+    }
+
+    /**
+     * Value of a condition node, negation included.
+     *
+     * A type that is not installed or is disabled is unknown: the administrator turned it off, so it
+     * must not suspend, remove or reactivate anybody. Conditions provided through the hook have no
+     * switch and are always enabled while their plugin is installed.
+     *
+     * @param array $node
+     * @param int $userid
+     * @param stdClass $instance
+     * @param array $enabled Enabled condition types, as keys.
+     * @return bool|null Null when the condition is unknown.
+     */
+    protected function condition_value(array $node, int $userid, stdClass $instance, array $enabled): ?bool {
+        if (!isset($enabled[$node['type']])) {
+            return null;
+        }
         $condition = manager::get_condition($node['type']);
         if (!$condition) {
-            $failures[] = ['message' => get_string('failureunknown', 'local_enrolconditions'), 'children' => []];
             return null;
         }
         try {
@@ -286,17 +378,31 @@ class tree {
         } catch (\Throwable $e) {
             // A failing condition (for example, a broken query) is unknown: it never suspends anybody.
             debugging("Condition '{$node['type']}' failed: " . $e->getMessage(), DEBUG_DEVELOPER);
-            $failures[] = ['message' => get_string('failureunknown', 'local_enrolconditions'), 'children' => []];
             return null;
         }
-        $value = $node['negate'] ? !$met : $met;
-        if (!$value) {
-            $message = $node['negate']
-                ? get_string('failurenot', 'local_enrolconditions', $condition->get_description($node['config'], true))
-                : $condition->get_description($node['config'], false);
-            $failures[] = ['message' => $message, 'children' => []];
+        return $node['negate'] ? !$met : $met;
+    }
+
+    /**
+     * Explanation of a condition node that is not met.
+     *
+     * The explanation is built at login (enrol_check_plugins()) and on the enrolment page, so a
+     * condition that throws here must not escape: it falls back to a generic text.
+     *
+     * @param array $node Condition node of an installed type.
+     * @return string
+     */
+    protected function describe(array $node): string {
+        try {
+            $condition = manager::get_condition($node['type']);
+            if ($node['negate']) {
+                return get_string('failurenot', 'local_enrolconditions', $condition->get_description($node['config'], true));
+            }
+            return $condition->get_description($node['config'], false);
+        } catch (\Throwable $e) {
+            debugging("Condition '{$node['type']}' could not describe itself: " . $e->getMessage(), DEBUG_DEVELOPER);
+            return get_string('failuredescription', 'local_enrolconditions');
         }
-        return $value;
     }
 
     /**
@@ -377,6 +483,19 @@ class tree {
             }
             return $node;
         }));
+    }
+
+    /**
+     * Copy of the tree with every condition node passed through a function, keeping the groups.
+     *
+     * The function changes configurations only (the privacy providers remove a person from a list); the structure
+     * is not checked again.
+     *
+     * @param callable $callback Receives a condition node (type, negate, config) and returns it changed.
+     * @return self
+     */
+    public function with_conditions(callable $callback): self {
+        return new self(self::map_conditions($this->root, $callback));
     }
 
     /**

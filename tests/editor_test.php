@@ -20,12 +20,6 @@ use local_enrolconditions\condition\manager;
 use local_enrolconditions\form\condition_config;
 use local_enrolconditions\output\tree_editor;
 
-defined('MOODLE_INTERNAL') || die();
-
-global $CFG;
-require_once($CFG->libdir . '/formslib.php');
-require_once(__DIR__ . '/fixtures/fake_condition.php');
-
 /**
  * Tests of the condition editor: the modal configuration form and the editor output.
  *
@@ -36,6 +30,14 @@ require_once(__DIR__ . '/fixtures/fake_condition.php');
 #[\PHPUnit\Framework\Attributes\CoversClass(condition_config::class)]
 #[\PHPUnit\Framework\Attributes\CoversClass(tree_editor::class)]
 final class editor_test extends \advanced_testcase {
+    #[\Override]
+    public static function setUpBeforeClass(): void {
+        global $CFG;
+        require_once($CFG->libdir . '/formslib.php');
+        require_once(__DIR__ . '/fixtures/fake_condition.php');
+        parent::setUpBeforeClass();
+    }
+
     #[\Override]
     protected function setUp(): void {
         parent::setUp();

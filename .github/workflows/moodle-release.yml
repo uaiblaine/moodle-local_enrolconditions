@@ -1,39 +1,28 @@
-name: Publish to Moodle Marketplace
-
-# Envia a versão marcada (tag v*) para o Moodle Marketplace pela API oficial.
-# Só roda depois que o plugin foi aprovado no Marketplace e a variável de repositório
-# MARKETPLACE_ENABLED vale 'true' (Settings > Secrets and variables > Actions > Variables).
-# Requer o secret MOODLE_MARKETPLACE_TOKEN (https://marketplace.moodle.com/account/security).
-# O envio espera a aprovação manual do environment "marketplace".
-# O workflow reutilizável está fixado por SHA (moodlehq/moodle-plugin-release, revision 2026091801).
+name: Moodle Plugin Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - v*
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to be released (e.g. v1.4.0)'
+        description: 'Git tag to be released'
         required: true
 
+# The called workflow checks out the tag and reads the GitHub release notes
+# (`gh release view`); it creates nothing on GitHub, so the token stays read-only.
 permissions:
   contents: read
 
 jobs:
-  approve:
-    name: Approve the Marketplace upload
-    if: ${{ vars.MARKETPLACE_ENABLED == 'true' }}
-    runs-on: ubuntu-latest
-    environment: marketplace
-    steps:
-      - run: echo "Upload of ${{ inputs.tag || github.ref_name }} to Moodle Marketplace approved."
-
-  release-to-marketplace:
-    name: Release to Moodle Marketplace
-    needs: approve
-    uses: moodlehq/moodle-plugin-release/.github/workflows/moodle-release.yml@4467fd51a0e7f4bcda665eb2f8fb00365d10a39d # revision 2026091801
+  # MOODLE_ORG_TOKEN is the moodle.org Marketplace token, so the code it reaches
+  # is pinned to a reviewed commit, never a branch. Called directly rather than
+  # through MAH's moodle-release.yml, which only forwards to this workflow at
+  # @main. Re-pin procedure: moodle-dev/docs/github-actions-pinning.md.
+  release:
+    uses: moodlehq/moodle-plugin-release/.github/workflows/moodle-release.yml@7c56bd9ce7b0a3125459924e7bd08570d41b9aa3 # main 2026-10-17
     with:
       tag: ${{ inputs.tag }}
     secrets:
-      MOODLE_MARKETPLACE_TOKEN: ${{ secrets.MOODLE_MARKETPLACE_TOKEN }}
+      MOODLE_MARKETPLACE_TOKEN: ${{ secrets.MOODLE_ORG_TOKEN }}

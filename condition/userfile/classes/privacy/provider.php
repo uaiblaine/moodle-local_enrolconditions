@@ -28,8 +28,10 @@ use local_enrolconditions\local\usernames;
 /**
  * Privacy provider: the files of usernames name the users they list.
  *
- * A user is found by their username in the files of each course. Deleting the data of a user removes their
- * line from the files.
+ * A user is found by their username in the files of each course, or, once their account is deleted, by the
+ * md5 of a listed name that core keeps in their email column ({@see usernames::matcher()}, shared with the list of
+ * usernames condition). Deleting the data of a user removes their line
+ * from the files and drops the cached list of the old content.
  *
  * @package    enrolcond_userfile
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
@@ -67,24 +69,16 @@ class provider implements
         return $files;
     }
 
-    /**
-     * Username of a user, in lower case.
-     *
-     * @param int $userid
-     * @return string|null
-     */
-    protected static function get_username(int $userid): ?string {
-        $user = \core_user::get_user($userid, 'id, username');
-        return $user ? \core_text::strtolower($user->username) : null;
-    }
-
     #[\Override]
     public static function get_contexts_for_userid(int $userid): contextlist {
         $contextlist = new contextlist();
-        $username = self::get_username($userid);
+        $matcher = usernames::matcher($userid);
         $contextids = [];
-        foreach ($username === null ? [] : self::get_files() as $file) {
-            if (isset(condition::get_usernames($file)[$username])) {
+        foreach ($matcher === null ? [] : self::get_files() as $file) {
+            if (isset($contextids[$file->get_contextid()])) {
+                continue;
+            }
+            if (usernames::find(condition::get_usernames($file), $matcher) !== null) {
                 $contextids[$file->get_contextid()] = true;
             }
         }
@@ -98,28 +92,27 @@ class provider implements
 
     #[\Override]
     public static function get_users_in_context(userlist $userlist): void {
-        global $DB;
         $listed = [];
         foreach (self::get_files($userlist->get_context()->id) as $file) {
             $listed += condition::get_usernames($file);
         }
-        foreach (array_chunk(array_keys($listed), 1000) as $chunk) {
-            [$insql, $params] = $DB->get_in_or_equal(array_map('strval', $chunk), SQL_PARAMS_NAMED);
-            $userlist->add_from_sql('id', "SELECT id FROM {user} WHERE username $insql", $params);
-        }
+        usernames::add_listed_users($userlist, array_map('strval', array_keys($listed)));
     }
 
     #[\Override]
     public static function export_user_data(approved_contextlist $contextlist): void {
-        $username = self::get_username((int) $contextlist->get_user()->id);
-        if ($username === null) {
+        $matcher = usernames::matcher((int) $contextlist->get_user()->id);
+        if ($matcher === null) {
             return;
         }
         foreach ($contextlist->get_contexts() as $context) {
             $names = [];
+            $username = null;
             foreach (self::get_files($context->id) as $file) {
-                if (isset(condition::get_usernames($file)[$username])) {
+                $found = usernames::find(condition::get_usernames($file), $matcher);
+                if ($found !== null) {
                     $names[] = $file->get_filename();
+                    $username = $found;
                 }
             }
             if ($names) {
@@ -132,20 +125,26 @@ class provider implements
     }
 
     /**
-     * Removes the lines of some usernames from the files of a context.
+     * Removes the lines of some users from the files of a context.
+     *
+     * The cached list of each rewritten or deleted content is dropped as well, on every node.
      *
      * @param int $contextid
-     * @param string[]|null $remove Usernames, in lower case; null removes the files.
+     * @param array|null $matchers Results of usernames::matcher(); null removes the files.
      */
-    protected static function remove_from_files(int $contextid, ?array $remove): void {
-        $remove = $remove === null ? null : array_fill_keys($remove, true);
+    protected static function remove_from_files(int $contextid, ?array $matchers): void {
         foreach (self::get_files($contextid) as $file) {
-            if ($remove === null) {
+            $oldhash = $file->get_contenthash();
+            if ($matchers === null) {
                 $file->delete();
+                condition::forget_usernames($oldhash);
                 continue;
             }
             $lines = preg_split('/\r\n|\r|\n/', $file->get_content());
-            $kept = array_filter($lines, fn(string $line): bool => !isset($remove[usernames::first_value($line) ?? '']));
+            $kept = array_filter($lines, function (string $line) use ($matchers): bool {
+                $value = usernames::first_value($line);
+                return $value === null || !usernames::names_any($value, $matchers);
+            });
             if (count($kept) === count($lines)) {
                 continue;
             }
@@ -159,6 +158,7 @@ class provider implements
             ];
             $file->delete();
             get_file_storage()->create_file_from_string($record, implode("\n", $kept));
+            condition::forget_usernames($oldhash);
         }
     }
 
@@ -169,20 +169,20 @@ class provider implements
 
     #[\Override]
     public static function delete_data_for_user(approved_contextlist $contextlist): void {
-        $username = self::get_username((int) $contextlist->get_user()->id);
-        if ($username === null) {
+        $matcher = usernames::matcher((int) $contextlist->get_user()->id);
+        if ($matcher === null) {
             return;
         }
         foreach ($contextlist->get_contexts() as $context) {
-            self::remove_from_files($context->id, [$username]);
+            self::remove_from_files($context->id, [$matcher]);
         }
     }
 
     #[\Override]
     public static function delete_data_for_users(approved_userlist $userlist): void {
-        $remove = array_filter(array_map(fn($userid) => self::get_username((int) $userid), $userlist->get_userids()));
-        if ($remove) {
-            self::remove_from_files($userlist->get_context()->id, array_values($remove));
+        $matchers = array_filter(array_map(fn($userid) => usernames::matcher((int) $userid), $userlist->get_userids()));
+        if ($matchers) {
+            self::remove_from_files($userlist->get_context()->id, array_values($matchers));
         }
     }
 }

@@ -21,7 +21,15 @@ namespace enrolcond_sqlquery\local;
  *
  * A query is a single SELECT (or WITH ... SELECT) that returns a column "username". It may use the parameter
  * :courseid, the course of the enrolment method. Only administrators (moodle/site:config) define queries; teachers
- * only choose one by its name.
+ * only choose one by its name, and every teacher who can configure an enrolment instance can use every list (and
+ * learn from the outcome whether a user is in it).
+ *
+ * check_text() is a guard against accidents, not a security boundary: a keyword denylist over SQL the administrator
+ * wrote cannot prove a statement read-only. The queries run with Moodle's database permissions; review them as code.
+ *
+ * Results are kept in the MUC application cache 'results' (shared by every node) for the configured time, keyed by
+ * the SQL alone when it has no :courseid and by the SQL and the course otherwise. One node refreshes an expired
+ * entry under a lock while the others serve the expired one.
  *
  * @package    enrolcond_sqlquery
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
@@ -44,6 +52,9 @@ class queries {
 
     /** @var array[] Results by query and course, in this request. */
     protected static array $results = [];
+
+    /** @var int Seconds a request waits for another node's refresh when it has no result to serve meanwhile. */
+    public const LOCK_WAIT = 10;
 
     /**
      * Number of query slots.
@@ -108,16 +119,21 @@ class queries {
     }
 
     /**
-     * Runs a query.
+     * Runs a query. Refuses while a transaction is open.
      *
      * @param string $sql
      * @param int $courseid
      * @param int $limit 0 for all rows.
      * @return bool[] Usernames in lower case, as keys.
-     * @throws \moodle_exception When the text is not acceptable or the query fails.
+     * @throws \moodle_exception When the text is not acceptable, the query fails or a transaction is open.
      */
     public static function run(string $sql, int $courseid, int $limit = 0): array {
         global $DB;
+        // The one place that refuses to run the admin's SQL inside the caller's transaction: every path that runs it
+        // ends here, and a failing query would abort that transaction (for example, an event observer's).
+        if ($DB->is_transaction_started()) {
+            throw new \moodle_exception('errortransaction', self::COMPONENT);
+        }
         $error = self::check_text($sql);
         if ($error !== null) {
             throw new \moodle_exception('errorquery', self::COMPONENT, '', $error);
@@ -137,12 +153,29 @@ class queries {
     }
 
     /**
+     * Cache key of the results of a query for a course.
+     *
+     * @param string $sql
+     * @param int $courseid
+     * @return string The SQL hash alone when the query does not use :courseid, so its one list is run and stored
+     *     once for every course.
+     */
+    public static function cache_key(string $sql, int $courseid): string {
+        return self::params($sql, $courseid) ? sha1($sql) . '_' . $courseid : sha1($sql);
+    }
+
+    /**
      * Usernames returned by a defined query for a course, cached for the configured time.
+     *
+     * With a cache time of 0 the query runs on every call. Otherwise an expired or missing entry is refreshed by one
+     * request at a time, under a core lock (every node shares it): while one runs the query, the others serve the
+     * expired entry, or wait up to LOCK_WAIT seconds when there is none.
      *
      * @param string $key Slot key.
      * @param int $courseid
      * @return bool[] Usernames in lower case, as keys.
-     * @throws \moodle_exception When the query no longer exists or fails.
+     * @throws \moodle_exception When the query no longer exists or fails, inside a transaction with nothing to serve,
+     *     or when another refresh holds the lock past the wait.
      */
     public static function get_usernames(string $key, int $courseid): array {
         $queries = self::get_queries();
@@ -150,28 +183,66 @@ class queries {
             throw new \moodle_exception('errormissing', self::COMPONENT, '', $key);
         }
         $sql = $queries[$key]['sql'];
-        $cachekey = sha1($sql) . '_' . $courseid;
+        $cachekey = self::cache_key($sql, $courseid);
         if (isset(self::$results[$cachekey])) {
             return self::$results[$cachekey];
         }
         $ttl = (int) get_config(self::COMPONENT, 'cachettl');
-        $cache = \cache::make(self::COMPONENT, 'results');
-        $cached = $ttl > 0 ? $cache->get($cachekey) : false;
-        if ($cached !== false && $cached['time'] > time() - $ttl) {
-            $usernames = $cached['usernames'];
-        } else {
-            global $DB;
-            if ($DB->is_transaction_started()) {
-                // A failing query would abort the transaction of the caller (for example, an event observer).
-                throw new \moodle_exception('errortransaction', self::COMPONENT);
-            }
-            $usernames = self::run($sql, $courseid);
-            if ($ttl > 0) {
-                $cache->set($cachekey, ['time' => time(), 'usernames' => $usernames]);
-            }
-        }
+        $usernames = $ttl > 0 ? self::get_cached($sql, $courseid, $cachekey, $ttl) : self::run($sql, $courseid);
         self::$results = [$cachekey => $usernames] + array_slice(self::$results, 0, 9, true);
         return $usernames;
+    }
+
+    /**
+     * Results from the shared cache, refreshed by one request at a time.
+     *
+     * @param string $sql
+     * @param int $courseid
+     * @param string $cachekey
+     * @param int $ttl Configured cache time, in seconds.
+     * @return bool[] Usernames as keys.
+     * @throws \moodle_exception
+     */
+    protected static function get_cached(string $sql, int $courseid, string $cachekey, int $ttl): array {
+        global $DB;
+        $cache = \cache::make(self::COMPONENT, 'results');
+        $cached = $cache->get($cachekey);
+        if ($cached !== false && $cached['time'] > time() - $ttl) {
+            return $cached['usernames'];
+        }
+        if ($cached !== false && $DB->is_transaction_started()) {
+            // Not refreshed inside the caller's transaction (run() refuses it): the expired entry is served.
+            return $cached['usernames'];
+        }
+
+        $factory = \core\lock\lock_config::get_lock_factory(self::COMPONENT);
+        $lock = $factory->get_lock($cachekey, $cached !== false ? 0 : self::LOCK_WAIT);
+        if (!$lock) {
+            // Another request is refreshing it: serve what there is.
+            $cached = $cached !== false ? $cached : $cache->get($cachekey);
+            if ($cached !== false) {
+                return $cached['usernames'];
+            }
+            throw new \moodle_exception('errorbusy', self::COMPONENT);
+        }
+        try {
+            // The request that held the lock may have refreshed it meanwhile.
+            $fresh = $cache->get($cachekey);
+            if ($fresh !== false && $fresh['time'] > time() - $ttl) {
+                return $fresh['usernames'];
+            }
+            try {
+                $usernames = self::run($sql, $courseid);
+            } catch (\Throwable $e) {
+                // An expired entry is not served after the query failed: the next request tries again.
+                $cache->delete($cachekey);
+                throw $e;
+            }
+            $cache->set($cachekey, ['time' => time(), 'usernames' => $usernames]);
+            return $usernames;
+        } finally {
+            $lock->release();
+        }
     }
 
     /**

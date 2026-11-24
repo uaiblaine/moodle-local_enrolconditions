@@ -289,6 +289,8 @@ class TreeEditor {
                 enrolcondcontextid: this.config.contextid,
                 enrolcondtype: type,
                 enrolcondconfig: node ? toJson(node.config || {}) : '',
+                enrolcondenrol: this.config.enrol || '',
+                enrolcondinstanceid: this.config.instanceid || 0,
             },
             modalConfig: {title: typeinfo ? typeinfo.name : (node && node.name) || type},
         });

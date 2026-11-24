@@ -24,7 +24,9 @@ use stdClass;
  * Condition met by the users whose usernames are in a file kept with the condition.
  *
  * The file (CSV or text, usernames in the first column) is stored in the course context, in the file area
- * enrolcond_userfile/usernames, item fileid. Teachers update the list by replacing the file.
+ * enrolcond_userfile/usernames, item fileid. Teachers update the list by replacing the file: every save of the
+ * dialog stores the file under a new item id, so a file already referenced by a stored tree is never rewritten
+ * from the dialog, and task\cleanup_files deletes the files no stored tree refers to.
  * Configuration: ['fileid' => item id, 'filename' => name, 'count' => number of usernames].
  *
  * @package    enrolcond_userfile
@@ -92,6 +94,19 @@ class condition extends \local_enrolconditions\condition\base {
         return self::$usernames[$hash];
     }
 
+    /**
+     * Forgets the usernames cached for a file content, on every node.
+     *
+     * Called when a file is rewritten or deleted to erase a user: otherwise the old list would stay readable
+     * under the old content hash until the cache expires.
+     *
+     * @param string $contenthash
+     */
+    public static function forget_usernames(string $contenthash): void {
+        unset(self::$usernames[$contenthash]);
+        \cache::make(self::COMPONENT, 'usernames')->delete($contenthash);
+    }
+
     #[\Override]
     public function is_met(int $userid, stdClass $instance, array $config): bool {
         $file = self::get_file($config, \context_course::instance($instance->courseid));
@@ -113,8 +128,6 @@ class condition extends \local_enrolconditions\condition\base {
 
     #[\Override]
     public function config_form_definition(MoodleQuickForm $mform): void {
-        $mform->addElement('hidden', 'fileid');
-        $mform->setType('fileid', PARAM_INT);
         $mform->addElement('filepicker', 'usernamesfile', get_string('file', self::COMPONENT), null, $this->picker_options());
         $mform->addHelpButton('usernamesfile', 'file', self::COMPONENT);
         $mform->addRule('usernamesfile', null, 'required', null, 'client');
@@ -132,7 +145,7 @@ class condition extends \local_enrolconditions\condition\base {
             empty($config['fileid']) ? null : (int) $config['fileid'],
             $this->picker_options()
         );
-        return ['fileid' => (int) ($config['fileid'] ?? 0), 'usernamesfile' => $draftitemid];
+        return ['usernamesfile' => $draftitemid];
     }
 
     /**
@@ -161,8 +174,9 @@ class condition extends \local_enrolconditions\condition\base {
     public function config_from_form_data(stdClass $data): array {
         $file = $this->get_draft_file((int) ($data->usernamesfile ?? 0));
         $list = $file ? usernames::parse_csv($file->get_content()) : [];
+        // The item id is chosen on submission, never taken from the post.
         return [
-            'fileid' => (int) ($data->fileid ?? 0),
+            'fileid' => 0,
             'filename' => $file ? $file->get_filename() : '',
             'count' => count($list),
         ];
@@ -192,17 +206,43 @@ class condition extends \local_enrolconditions\condition\base {
         return [];
     }
 
+    /**
+     * Stores the file of the dialog under a new item, as the file of the user who saved the dialog.
+     *
+     * A new item every time: rewriting the item of the stored configuration would change the list of an instance
+     * whose form is never saved, and an item posted by the client may belong to another instance. The stored file
+     * names the saving user as its owner (not the owner of the draft copy, which the dialog of a stored node
+     * pre-fills from the original uploader's file): check_access() lets only that user reference it in a new node.
+     *
+     * @param array $config
+     * @param stdClass $data
+     * @param \context $context Course context.
+     * @return array
+     */
     #[\Override]
     public function config_after_submission(array $config, stdClass $data, \context $context): array {
-        $fileid = (int) ($config['fileid'] ?? 0) ?: random_int(1, 2147483647);
-        file_save_draft_area_files(
-            (int) $data->usernamesfile,
-            $context->id,
-            self::COMPONENT,
-            self::FILEAREA,
-            $fileid,
-            $this->picker_options()
-        );
+        global $USER;
+        $draft = $this->get_draft_file((int) ($data->usernamesfile ?? 0));
+        if (!$draft) {
+            // The form validation requires a file: nothing to store, and the configuration stays invalid.
+            return $config;
+        }
+        $fs = get_file_storage();
+        do {
+            $fileid = random_int(1, 2147483647);
+        } while (!$fs->is_area_empty($context->id, self::COMPONENT, self::FILEAREA, $fileid));
+        $now = time();
+        $fs->create_file_from_storedfile([
+            'contextid' => $context->id,
+            'component' => self::COMPONENT,
+            'filearea' => self::FILEAREA,
+            'itemid' => $fileid,
+            'filepath' => '/',
+            'filename' => $draft->get_filename(),
+            'userid' => (int) $USER->id,
+            'timecreated' => $now,
+            'timemodified' => $now,
+        ], $draft);
         $config['fileid'] = $fileid;
         return $config;
     }
@@ -213,5 +253,52 @@ class condition extends \local_enrolconditions\condition\base {
             return ['usernamesfile' => get_string('required')];
         }
         return [];
+    }
+
+    /**
+     * A new or changed configuration may only name a file of this course, stored by the current user through the
+     * dialog, that no stored tree refers to.
+     *
+     * The dialog stores each file under a new item and as the saving user's ({@see config_after_submission()}), so
+     * a legitimate new node always passes; an item of another instance's file, or a file another teacher uploaded
+     * and has not saved in a tree yet (posted by hand), would share or expose that list.
+     *
+     * @param array $config
+     * @param \context $context Course context.
+     * @return string|null
+     */
+    #[\Override]
+    public function check_access(array $config, \context $context): ?string {
+        global $USER;
+        $fileid = (int) ($config['fileid'] ?? 0);
+        if ($fileid <= 0) {
+            return null;
+        }
+        if ($context->contextlevel !== CONTEXT_COURSE) {
+            return get_string('noaccess', self::COMPONENT);
+        }
+        $file = self::get_file($config, $context);
+        if (
+            !$file || (int) $file->get_userid() !== (int) $USER->id
+                || isset(task\cleanup_files::get_referenced_fileids((int) $context->instanceid)[$fileid])
+        ) {
+            return get_string('noaccess', self::COMPONENT);
+        }
+        return null;
+    }
+
+    /**
+     * Backups carry the file: the backup step of the enrolment method annotates this file area and its restore step
+     * restores it (enrol_conditional does both), so a restore on this site keeps the configuration and its file. A
+     * list of usernames of another site names other people: from another site the configuration drops its file,
+     * so the condition is unknown (nobody enrols) until a teacher supplies a new file.
+     *
+     * @param array $config
+     * @param bool $samesite
+     * @return array
+     */
+    #[\Override]
+    public function restore_config(array $config, bool $samesite): array {
+        return $samesite ? $config : ['fileid' => 0, 'filename' => '', 'count' => 0];
     }
 }

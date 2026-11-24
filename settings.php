@@ -51,6 +51,13 @@ if ($hassiteconfig) {
             500,
             PARAM_INT
         ));
+        $settings->add(new admin_setting_configduration(
+            'local_enrolconditions/checktimelimit',
+            new lang_string('checktimelimit', 'local_enrolconditions'),
+            new lang_string('checktimelimit_desc', 'local_enrolconditions'),
+            60,
+            1
+        ));
     }
     $ADMIN->add('local_enrolconditions_folder', $settings);
 

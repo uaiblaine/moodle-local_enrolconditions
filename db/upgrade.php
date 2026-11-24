@@ -30,10 +30,16 @@
  */
 function xmldb_local_enrolconditions_upgrade(int $oldversion): bool {
     if ($oldversion < 2026111801) {
-        // State of the generic enforcer. The upgrade of enrol_conditional, which runs first, may have created it
-        // already to move its own records.
+        // The state table may already exist: an enrolment method upgraded before this plugin can create it.
         \local_enrolconditions\local\schema::create_state_table();
         upgrade_plugin_savepoint(true, 2026111801, 'local', 'enrolconditions');
+    }
+
+    if ($oldversion < 2026112300) {
+        // The periodic position is now "instance id,user id" in periodicposition; the old cursor was a
+        // user enrolment id, which means nothing in the new order, so the next cycle starts from the beginning.
+        unset_config('periodiccursor', 'local_enrolconditions');
+        upgrade_plugin_savepoint(true, 2026112300, 'local', 'enrolconditions');
     }
 
     return true;

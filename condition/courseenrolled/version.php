@@ -25,9 +25,9 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'enrolcond_courseenrolled';
-$plugin->version = 2026112100;
+$plugin->version = 2026112301;
 $plugin->requires = 2026100200;
 $plugin->supported = [503, 503];
 $plugin->release = '1.0.0';
 $plugin->maturity = MATURITY_STABLE;
-$plugin->dependencies = ['local_enrolconditions' => 2026111801];
+$plugin->dependencies = ['local_enrolconditions' => 2026112301];

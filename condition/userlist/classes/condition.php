@@ -34,10 +34,35 @@ class condition extends \local_enrolconditions\condition\base {
     /** @var int Maximum number of usernames in a list. */
     public const MAX_USERNAMES = 5000;
 
+    /** @var array[] Lists flipped for lookup, by the hash of their configuration, in this request. */
+    protected static array $lookups = [];
+
     #[\Override]
     public function is_met(int $userid, stdClass $instance, array $config): bool {
+        $list = $config['usernames'] ?? [];
+        if (!is_array($list) || !$list) {
+            // An empty list cannot be evaluated: unknown, never "nobody listed" and never "everybody". It is empty
+            // after a restore from another site and after a privacy erasure, until a teacher types a list.
+            throw new \moodle_exception('emptylist', 'enrolcond_userlist');
+        }
         $user = \core_user::get_user($userid, 'id, username');
-        return $user && in_array(\core_text::strtolower($user->username), $config['usernames'] ?? [], true);
+        return $user && isset(self::lookup($list)[\core_text::strtolower($user->username)]);
+    }
+
+    /**
+     * A list of usernames as array keys, kept for the rest of the request.
+     *
+     * The same list is checked for every user of an instance in the scheduled re-check.
+     *
+     * @param array $list Usernames in lower case.
+     * @return array Usernames as keys.
+     */
+    protected static function lookup(array $list): array {
+        $key = sha1(json_encode($list));
+        if (!isset(self::$lookups[$key])) {
+            self::$lookups = [$key => array_flip(array_map('strval', $list))] + array_slice(self::$lookups, 0, 9, true);
+        }
+        return self::$lookups[$key];
     }
 
     #[\Override]
@@ -60,6 +85,19 @@ class condition extends \local_enrolconditions\condition\base {
     #[\Override]
     public function config_from_form_data(stdClass $data): array {
         return ['usernames' => usernames::parse_list((string) ($data->usernames ?? ''))];
+    }
+
+    /**
+     * A list of usernames of another site names other people: from another site the condition comes back with an
+     * empty list, so it is unknown (nobody enrols) until a teacher types the list again.
+     *
+     * @param array $config
+     * @param bool $samesite
+     * @return array
+     */
+    #[\Override]
+    public function restore_config(array $config, bool $samesite): array {
+        return $samesite ? $config : ['usernames' => []];
     }
 
     #[\Override]

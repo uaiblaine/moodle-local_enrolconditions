@@ -22,13 +22,6 @@ use local_enrolconditions\fixtures\hooked_condition;
 use local_enrolconditions\hook\collect_conditions;
 use local_enrolconditions\plugininfo\enrolcond;
 
-defined('MOODLE_INTERNAL') || die();
-
-global $CFG;
-require_once($CFG->libdir . '/adminlib.php');
-require_once(__DIR__ . '/fixtures/fake_condition.php');
-require_once(__DIR__ . '/fixtures/hooked_condition.php');
-
 /**
  * Tests of the condition infrastructure: subplugin type, manager, hook and admin pages.
  *
@@ -41,6 +34,15 @@ require_once(__DIR__ . '/fixtures/hooked_condition.php');
 #[\PHPUnit\Framework\Attributes\CoversClass(condition\base::class)]
 #[\PHPUnit\Framework\Attributes\CoversClass(collect_conditions::class)]
 final class condition_manager_test extends \advanced_testcase {
+    #[\Override]
+    public static function setUpBeforeClass(): void {
+        global $CFG;
+        require_once($CFG->libdir . '/adminlib.php');
+        require_once(__DIR__ . '/fixtures/fake_condition.php');
+        require_once(__DIR__ . '/fixtures/hooked_condition.php');
+        parent::setUpBeforeClass();
+    }
+
     #[\Override]
     protected function setUp(): void {
         parent::setUp();
@@ -137,6 +139,40 @@ final class condition_manager_test extends \advanced_testcase {
         $this->assertFalse(enrolcond::enable_plugin('fake', 0));
         $this->assertTrue(enrolcond::enable_plugin('fake', 1));
         $this->assertFalse(get_config('enrolcond_fake', 'disabled'));
+    }
+
+    public function test_enable_plugin_purges_the_event_map(): void {
+        $cache = \cache::make('local_enrolconditions', 'observedevents');
+        $cache->set('map', ['stale' => true]);
+
+        // Control: a call that changes nothing keeps the map.
+        $this->assertFalse(enrolcond::enable_plugin('cohort', 1));
+        $this->assertSame(['stale' => true], $cache->get('map'));
+
+        $this->assertTrue(enrolcond::enable_plugin('cohort', 0));
+        $this->assertFalse($cache->get('map'));
+        $cache->set('map', ['stale' => true]);
+        $this->assertTrue(enrolcond::enable_plugin('cohort', 1));
+        $this->assertFalse($cache->get('map'));
+    }
+
+    public function test_enforceable_lookup(): void {
+        global $DB;
+        require_once(__DIR__ . '/fixtures/fake_enforceable.php');
+        $this->assertNull(manager::get_enforceable('manual'));
+        $this->assertNull(manager::get_enforceable(''));
+        $this->assertArrayNotHasKey('manual', manager::get_enforceable_plugins());
+
+        manager::register_enforceable_for_testing('manual', new \local_enrolconditions_fake_enforceable());
+        $this->assertInstanceOf(\local_enrolconditions\enforceable::class, manager::get_enforceable('manual'));
+        $this->assertArrayHasKey('manual', manager::get_enforceable_plugins());
+
+        $course = $this->getDataGenerator()->create_course();
+        $json = json_encode(['op' => 'and', 'children' => [['type' => 'fake', 'config' => ['userids' => [1]]]]]);
+        $DB->set_field('enrol', 'customtext1', $json, ['courseid' => $course->id, 'enrol' => 'manual']);
+        $trees = manager::get_course_trees((int) $course->id);
+        $this->assertCount(1, $trees);
+        $this->assertSame([1], reset($trees)->to_array()['children'][0]['config']['userids']);
     }
 
     public function test_admin_pages(): void {

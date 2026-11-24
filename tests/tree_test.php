@@ -16,11 +16,13 @@
 
 namespace local_enrolconditions;
 
+use local_enrolconditions\condition\editor_access;
 use local_enrolconditions\condition\manager;
 
 defined('MOODLE_INTERNAL') || die();
 
 require_once(__DIR__ . '/fixtures/fake_condition.php');
+require_once(__DIR__ . '/fixtures/scripted_condition.php');
 
 /**
  * Tests of the condition tree: structure, AND/OR/NOT evaluation, unknown types and validation.
@@ -41,6 +43,8 @@ final class tree_test extends \advanced_testcase {
         $this->resetAfterTest();
         manager::reset_caches();
         manager::register_for_testing('fake', new \enrolcond_fake\condition());
+        manager::register_for_testing('scripted', new fixtures\scripted_condition());
+        fixtures\scripted_condition::$calls = 0;
     }
 
     #[\Override]
@@ -239,5 +243,122 @@ final class tree_test extends \advanced_testcase {
         $this->assertSame(['courseid' => 0], $other['children'][1]['children'][0]['config']);
         $this->assertSame(['x' => 1], $other['children'][1]['children'][1]['config']);
         $this->assertSame(['userids' => [3]], $other['children'][1]['children'][2]['config']);
+    }
+
+    /**
+     * Evaluation without explanations gives the same three values.
+     *
+     * @param array $root
+     * @param bool|null $expected
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('evaluation_provider')]
+    public function test_evaluate_without_explanations(array $root, ?bool $expected): void {
+        $result = tree::from_array($root)->evaluate(1, (object) ['id' => 1, 'courseid' => 1], false);
+        $this->assertSame($expected, $result->get_value());
+        $this->assertSame([], $result->get_failures());
+    }
+
+    /**
+     * Scripted condition node.
+     *
+     * @param bool $met
+     * @param array $extra More configuration.
+     * @return array
+     */
+    protected static function scripted(bool $met, array $extra = []): array {
+        return ['type' => 'scripted', 'negate' => false, 'config' => ['met' => $met] + $extra];
+    }
+
+    public function test_evaluation_without_explanations_stops_at_the_deciding_child(): void {
+        $instance = (object) ['id' => 1, 'courseid' => 1];
+
+        $this->assertFalse(tree::from_array(self::group('and', [self::cond([2]), self::scripted(true)]))
+            ->evaluate(1, $instance, false)->get_value());
+        $this->assertTrue(tree::from_array(self::group('or', [self::cond([1]), self::scripted(false)]))
+            ->evaluate(1, $instance, false)->get_value());
+        $this->assertSame(0, fixtures\scripted_condition::$calls);
+
+        // Controls: a child that does not decide lets the next one run, and the full evaluation runs all.
+        $this->assertTrue(tree::from_array(self::group('and', [self::cond([1]), self::scripted(true)]))
+            ->evaluate(1, $instance, false)->get_value());
+        $this->assertSame(1, fixtures\scripted_condition::$calls);
+        tree::from_array(self::group('and', [self::cond([2]), self::scripted(true)]))->evaluate(1, $instance);
+        $this->assertSame(2, fixtures\scripted_condition::$calls);
+
+        // An unknown child does not decide: a later false still makes AND false.
+        $unknown = ['type' => 'missing', 'negate' => false, 'config' => []];
+        $this->assertFalse(tree::from_array(self::group('and', [$unknown, self::scripted(false)]))
+            ->evaluate(1, $instance, false)->get_value());
+    }
+
+    public function test_disabled_type_is_unknown(): void {
+        $instance = (object) ['id' => 1, 'courseid' => 1];
+        $tree = tree::from_array(self::group('and', [['type' => 'date', 'config' => ['to' => time() - HOURSECS]]]));
+        $this->assertFalse($tree->evaluate(1, $instance)->get_value());
+
+        set_config('disabled', 1, 'enrolcond_date');
+        $this->assertNull($tree->evaluate(1, $instance)->get_value());
+        $this->assertNull($tree->evaluate(1, $instance, false)->get_value());
+        $this->assertSame(
+            get_string('failureunknown', 'local_enrolconditions'),
+            $tree->evaluate(1, $instance)->get_failures()[0]['message']
+        );
+
+        // A condition provided without a switch (here registered by the test) cannot be disabled.
+        $this->assertTrue(tree::from_array(self::group('and', [self::cond([1])]))->evaluate(1, $instance)->is_met());
+    }
+
+    public function test_description_that_throws_does_not_escape(): void {
+        $instance = (object) ['id' => 1, 'courseid' => 1];
+        $result = tree::from_array(self::group('and', [self::scripted(false, ['describethrows' => true])]))
+            ->evaluate(1, $instance);
+        $this->assertDebuggingCalled();
+        $this->assertFalse($result->get_value());
+        $this->assertSame(get_string('failuredescription', 'local_enrolconditions'), $result->get_failures()[0]['message']);
+
+        // Control: the description of a condition that does not throw is shown.
+        $result = tree::from_array(self::group('and', [self::scripted(false)]))->evaluate(1, $instance);
+        $this->assertSame('Scripted not met', $result->get_failures()[0]['message']);
+    }
+
+    public function test_validate_asks_access_only_for_new_conditions(): void {
+        $context = \context_system::instance();
+        $denied = self::scripted(true, ['denied' => 'Not yours']);
+        $tree = tree::from_array(self::group('and', [self::cond([1]), $denied]));
+
+        $a = ['name' => 'Scripted condition', 'error' => 'Not yours'];
+        $error = get_string('treeconditionerror', 'local_enrolconditions', $a);
+        $this->assertSame([$error], $tree->validate([], $context));
+
+        // Without a context the access is not checked.
+        $this->assertSame([], $tree->validate());
+
+        // A condition stored unchanged, wherever it moved and whatever its negation, is not asked again.
+        $stored = tree::from_array(self::group('or', [self::group('and', [['type' => 'scripted', 'negate' => true,
+            'config' => ['denied' => 'Not yours', 'met' => true]]])]));
+        $this->assertSame([], $tree->validate([], $context, $stored));
+
+        // A changed configuration is new.
+        $changed = tree::from_array(self::group('and', [self::scripted(false, ['denied' => 'Not yours'])]));
+        $this->assertSame([$error], $changed->validate([], $context, $stored));
+    }
+
+    public function test_validate_and_editor_decide_alike_on_a_stored_node(): void {
+        $context = \context_system::instance();
+        $config = ['met' => true, 'denied' => 'Not yours'];
+        $stored = tree::from_array(self::group('and', [['type' => 'scripted', 'negate' => false, 'config' => $config]]));
+        $keys = editor_access::get_node_keys($stored->to_array());
+
+        // Moved into a nested group, negated and with its config keys reordered: still the stored node for both doors.
+        $moved = self::group('or', [self::group('and', [['type' => 'scripted', 'negate' => true,
+            'config' => ['denied' => 'Not yours', 'met' => true]]])]);
+        $this->assertSame([], tree::from_array($moved)->validate([], $context, $stored));
+        $this->assertNull(editor_access::check_node('scripted', ['denied' => 'Not yours', 'met' => true], $context, $keys));
+
+        // Control: the same node with a changed value is new for both doors.
+        $changed = ['met' => true, 'denied' => 'Other'];
+        $newtree = tree::from_array(self::group('and', [['type' => 'scripted', 'negate' => false, 'config' => $changed]]));
+        $this->assertCount(1, $newtree->validate([], $context, $stored));
+        $this->assertSame('Other', editor_access::check_node('scripted', $changed, $context, $keys));
     }
 }

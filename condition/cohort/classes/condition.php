@@ -34,7 +34,12 @@ class condition extends \local_enrolconditions\condition\base {
         global $CFG;
         require_once($CFG->dirroot . '/cohort/lib.php');
         $cohortid = (int) ($config['cohortid'] ?? 0);
-        return $cohortid > 0 && cohort_is_member($cohortid, $userid);
+        if (!self::records_exist('cohort', [$cohortid])) {
+            // A deleted cohort has no members, which is not the same as "not a member": the condition is
+            // unknown (also after a restore from another site, which leaves id 0) until a teacher fixes it.
+            throw new \moodle_exception('missingcohort', 'enrolcond_cohort');
+        }
+        return cohort_is_member($cohortid, $userid);
     }
 
     /**
@@ -101,21 +106,35 @@ class condition extends \local_enrolconditions\condition\base {
     public function validate_config(array $config): array {
         global $DB;
         $cohortid = (int) ($config['cohortid'] ?? 0);
-        if ($cohortid <= 0 || !$DB->record_exists('cohort', ['id' => $cohortid])) {
+        if ($cohortid <= 0) {
             return ['cohortid' => get_string('invalidcohort', 'enrolcond_cohort')];
+        }
+        if (!$DB->record_exists('cohort', ['id' => $cohortid])) {
+            // Reached only for a node stored unchanged (or without a reach check): a new one is refused before.
+            return ['cohortid' => get_string('missingcohort', 'enrolcond_cohort')];
         }
         return [];
     }
 
+    /**
+     * The cohort must be one the user may use in the course: the rule of cohort_can_view_cohort() from the course
+     * context, which is also what cohort_get_available_cohorts() lists in the dialog (a cohort of a parent
+     * context, visible or with moodle/cohort:view in its context). A cohort that does not exist gets the same
+     * answer as one out of reach (cohort_can_view_cohort() is false for it).
+     *
+     * @param array $config
+     * @param \context $context Course context.
+     * @return string|null
+     */
     #[\Override]
-    public function config_form_validation(array $data, array $files): array {
-        $errors = parent::config_form_validation($data, $files);
-        $cohortid = (int) ($data['cohortid'] ?? 0);
-        if (!$errors && !array_key_exists($cohortid, $this->get_cohort_options())) {
-            // The user can only choose cohorts visible to them in the course.
-            $errors['cohortid'] = get_string('invalidcohort', 'enrolcond_cohort');
+    public function check_access(array $config, \context $context): ?string {
+        global $CFG;
+        require_once($CFG->dirroot . '/cohort/lib.php');
+        $cohortid = (int) ($config['cohortid'] ?? 0);
+        if ($cohortid > 0 && !cohort_can_view_cohort($cohortid, $context)) {
+            return get_string('noaccess', 'enrolcond_cohort');
         }
-        return $errors;
+        return null;
     }
 
     #[\Override]

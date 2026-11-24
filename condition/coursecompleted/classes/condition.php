@@ -16,6 +16,7 @@
 
 namespace enrolcond_coursecompleted;
 
+use local_enrolconditions\condition\base;
 use MoodleQuickForm;
 use stdClass;
 
@@ -28,13 +29,15 @@ use stdClass;
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
  * @license    https://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
-class condition extends \local_enrolconditions\condition\base {
+class condition extends base {
     #[\Override]
     public function is_met(int $userid, stdClass $instance, array $config): bool {
         global $DB;
         $courseid = (int) ($config['courseid'] ?? 0);
-        if ($courseid <= 0) {
-            return false;
+        if (!self::records_exist('course', [$courseid])) {
+            // A deleted course has no completion rows, which is not the same as "not completed": the condition is
+            // unknown (also after a restore from another site, which leaves id 0) until a teacher fixes it.
+            throw new \moodle_exception('missingcourse', 'enrolcond_coursecompleted');
         }
         return $DB->record_exists_select(
             'course_completions',
@@ -74,10 +77,31 @@ class condition extends \local_enrolconditions\condition\base {
     public function validate_config(array $config): array {
         global $DB;
         $courseid = (int) ($config['courseid'] ?? 0);
-        if ($courseid <= 0 || $courseid == SITEID || !$DB->record_exists('course', ['id' => $courseid])) {
+        if ($courseid <= 0 || $courseid == SITEID) {
             return ['courseid' => get_string('invalidcourse', 'enrolcond_coursecompleted')];
         }
+        if (!$DB->record_exists('course', ['id' => $courseid])) {
+            // Reached only for a node stored unchanged (or without a reach check): a new one is refused before.
+            return ['courseid' => get_string('missingcourse', 'enrolcond_coursecompleted')];
+        }
         return [];
+    }
+
+    /**
+     * The course must be one the user may name ({@see base::can_reference_course()}); a course that does not exist
+     * gets the same answer as one out of reach.
+     *
+     * @param array $config
+     * @param \context $context Course context.
+     * @return string|null
+     */
+    #[\Override]
+    public function check_access(array $config, \context $context): ?string {
+        $courseid = (int) ($config['courseid'] ?? 0);
+        if ($courseid > 0 && !self::can_reference_course($courseid)) {
+            return get_string('noaccess', 'enrolcond_coursecompleted');
+        }
+        return null;
     }
 
     #[\Override]

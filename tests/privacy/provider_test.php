@@ -123,4 +123,8 @@ final class provider_test extends \core_privacy\tests\provider_testcase {
         $this->assertEquals([$this->contexts[0]->id], provider::get_contexts_for_userid($this->users[1]->id)->get_contextids());
         $this->assertSame(3, $DB->count_records(enforcer::TABLE));
     }
+
+    public function test_component_is_compliant(): void {
+        $this->assertTrue((new \core_privacy\manager())->component_is_compliant('local_enrolconditions'));
+    }
 }
