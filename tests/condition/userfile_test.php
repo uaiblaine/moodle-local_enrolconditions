@@ -550,6 +550,25 @@ final class userfile_test extends \core_privacy\tests\provider_testcase {
         $this->assertSame(get_string('noaccess', condition::COMPONENT), $condition->check_access($named, $context));
     }
 
+    public function test_check_access_refuses_a_file_a_disabled_instance_uses(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $context = \context_course::instance($course->id);
+        $condition = new condition();
+        $stored = $this->save($course, "ana\n");
+        $fresh = $this->save($course, "bia\n");
+        $this->store($course, $stored);
+        $DB->set_field('enrol', 'status', ENROL_INSTANCE_DISABLED, ['courseid' => $course->id, 'enrol' => 'manual']);
+
+        // A disabled instance keeps its tree, which is in force again once it is enabled.
+        $this->assertSame(get_string('noaccess', condition::COMPONENT), $condition->check_access($stored, $context));
+        // Control: the file the dialog has just stored, which no tree uses yet.
+        $this->assertNull($condition->check_access($fresh, $context));
+    }
+
     public function test_check_access_refuses_a_file_another_teacher_uploaded(): void {
         $this->resetAfterTest();
         $this->use_fake_enforceable();
