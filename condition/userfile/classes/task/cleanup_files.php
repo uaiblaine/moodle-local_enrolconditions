@@ -105,13 +105,31 @@ class cleanup_files extends \core\task\scheduled_task {
                 }
                 continue;
             }
-            array_walk_recursive($data, function ($value, $key) use (&$ids): void {
-                if ($key === 'fileid' && (int) $value > 0) {
-                    $ids[(int) $value] = true;
-                }
-            });
+            self::collect_spared_fileids($data, $ids);
         }
         return $ids;
+    }
+
+    /**
+     * Adds the file ids named by a decoded value, at any depth.
+     *
+     * A key "fileid" names the file its value casts to with (int), whatever the type of the value, as
+     * {@see condition::get_file()} reads it: the cast is silent for every type JSON decodes to, and an array
+     * casts to 1, so a node with an array there is evaluated on the file of item 1. The walk also goes into every
+     * array value, so a "fileid" under a "fileid" counts too.
+     *
+     * @param array $data Decoded JSON.
+     * @param array $ids Receives the file ids as keys.
+     */
+    protected static function collect_spared_fileids(array $data, array &$ids): void {
+        foreach ($data as $key => $value) {
+            if ($key === 'fileid' && (int) $value > 0) {
+                $ids[(int) $value] = true;
+            }
+            if (is_array($value)) {
+                self::collect_spared_fileids($value, $ids);
+            }
+        }
     }
 
     /**

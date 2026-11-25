@@ -528,6 +528,42 @@ final class userfile_test extends \core_privacy\tests\provider_testcase {
         $this->assertNull(condition::get_file($control, \context_course::instance($other->id)));
     }
 
+    public function test_cleanup_reads_a_file_id_as_the_condition_does(): void {
+        global $DB, $USER;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $context = \context_course::instance($course->id);
+        $unnamed = $this->save($course, "ana\n");
+        $viastring = $this->save($course, "bia\n");
+        // A file of item 1, which the condition reads for an id that is an array: (int) of a non-empty array is 1.
+        get_file_storage()->create_file_from_string([
+            'contextid' => $context->id,
+            'component' => condition::COMPONENT,
+            'filearea' => condition::FILEAREA,
+            'itemid' => 1,
+            'filepath' => '/',
+            'filename' => 'students.csv',
+            'userid' => (int) $USER->id,
+        ], "carla\n");
+        $viaarray = ['fileid' => [7], 'filename' => 'students.csv', 'count' => 1];
+        $this->assertNotNull(condition::get_file($viaarray, $context));
+        $this->assertSame(1, (int) condition::get_file($viaarray, $context)->get_itemid());
+        // The tree layer checks only the structure of a node, so the value is a tree the engine evaluates.
+        $DB->set_field('enrol', 'customtext1', json_encode(['op' => 'and', 'children' => [
+            ['type' => 'userfile', 'config' => $viaarray],
+            ['type' => 'userfile', 'config' => ['fileid' => (string) $viastring['fileid']]],
+        ]]), ['courseid' => $course->id, 'enrol' => 'manual']);
+        $this->age_files();
+
+        $this->assertMatchesRegularExpression('/^1 files of usernames deleted\./', $this->run_cleanup());
+        $this->assertNotNull(condition::get_file($viaarray, $context));
+        $this->assertNotNull(condition::get_file($viastring, $context));
+        // Control: the old file nothing names goes.
+        $this->assertNull(condition::get_file($unnamed, $context));
+    }
+
     public function test_check_access_ignores_a_stored_value_that_does_not_validate(): void {
         global $DB;
         $this->resetAfterTest();
