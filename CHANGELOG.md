@@ -2,6 +2,11 @@
 
 All notable changes to the Enrolment conditions plugin will be documented in this file.
 
+## 1.2.0+uai.3 - 2026-11-25
+
+### Fixed
+- `\enrolcond_userfile\task\cleanup_files` deleted a file that only a stored value it could not evaluate named (a tree that does not validate, kept by a restore, or an instance of an enrolment method that is no longer installed). A file is now deleted only when every stored value of its course was read and none names it: such a value keeps the file, a value that names a file but cannot be read, or a method that cannot be asked for its tree, keeps every file of the course for that run, and the run prints how many courses were kept.
+
 ## 1.2.0+uai.2 - 2026-11-23
 
 ### Security

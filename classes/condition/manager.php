@@ -213,6 +213,47 @@ class manager {
     }
 
     /**
+     * Every stored value of a course that may hold a condition tree, valid or not, as text.
+     *
+     * Unlike {@see get_course_trees()} it leaves nothing out because it cannot be evaluated, so a caller that
+     * removes what no tree names can tell what it has not read:
+     * - an instance of an installed method that stores trees gives the text its method returns, valid or not;
+     * - an instance of a method that is not installed gives every string column whose name starts with
+     *   "custom". Such a method cannot be asked which column holds its tree, its rows outlive its directory
+     *   and its trees are in force again once it is back, so any of those columns may hold one;
+     * - an instance of an installed method that does not store trees gives nothing.
+     *
+     * @param int $courseid
+     * @return string[] Non-empty texts, in the order of the instances.
+     * @throws \Throwable What the method of an instance throws when it is asked for its tree.
+     */
+    public static function get_course_stored_values(int $courseid): array {
+        $values = [];
+        foreach (enrol_get_instances($courseid, false) as $instance) {
+            $name = (string) $instance->enrol;
+            $plugin = static::get_enforceable($name);
+            if ($plugin) {
+                $texts = [$plugin->get_enforcement_tree($instance)];
+            } else if (enrol_get_plugin($name) === null) {
+                $texts = [];
+                foreach (get_object_vars($instance) as $column => $value) {
+                    if (str_starts_with((string) $column, 'custom')) {
+                        $texts[] = $value;
+                    }
+                }
+            } else {
+                continue;
+            }
+            foreach ($texts as $text) {
+                if (is_string($text) && $text !== '') {
+                    $values[] = $text;
+                }
+            }
+        }
+        return $values;
+    }
+
+    /**
      * Instances whose stored tree uses a condition type, with their tree, through the methods' own API.
      *
      * Every installed method that stores condition trees counts, enabled or not, and every instance of it (one

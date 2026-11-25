@@ -23,9 +23,13 @@ use local_enrolconditions\condition\manager;
  * Deletes files of usernames that no condition refers to any more.
  *
  * They are left behind when a condition is removed, or when its form is saved but the enrolment method is not.
- * Files younger than a day are kept, so forms still open are not affected. The references of a course are read
- * once for the run and again right before each deletion, since a teacher may save a tree that uses the file
- * meanwhile; the cached list of usernames of a deleted file is dropped on every node.
+ * Files younger than a day are kept, so forms still open are not affected. A file is deleted only when every
+ * stored value of its course was read and none names it ({@see get_spared_fileids()}): a value that names a file
+ * but is not valid JSON, a method that cannot be asked for its tree, and the columns of a method that is not
+ * installed all keep the files of their course, since a deletion cannot be undone. A course skipped that way is
+ * counted in the output of the run and tried again on the next one. The references of a course are read once for
+ * the run and again right before each deletion, since a teacher may save a tree that uses the file meanwhile; the
+ * cached list of usernames of a deleted file is dropped on every node.
  *
  * @package    enrolcond_userfile
  * @copyright  2026 Kelson Medeiros <kelsoncm@gmail.com>
@@ -38,10 +42,13 @@ class cleanup_files extends \core\task\scheduled_task {
     }
 
     /**
-     * File ids referred to by the stored condition trees of the enrolment instances of a course.
+     * File ids referred to by the valid stored condition trees of the enrolment instances of a course.
      *
-     * Every method that stores condition trees counts, enabled or not, read through its own API
-     * (\local_enrolconditions\enforceable::get_enforcement_tree()), so no method's files are deleted.
+     * This is the "a tree in force uses this file" rule of {@see condition::check_access()}: every method that
+     * stores condition trees counts, enabled or not, read through its own API
+     * (\local_enrolconditions\enforceable::get_enforcement_tree()), and a value that is not a valid tree is not in
+     * force. Deletions are decided by {@see get_spared_fileids()} instead, which also counts the values nothing
+     * can evaluate, since a deletion cannot be undone.
      *
      * @param int $courseid
      * @return bool[] Keys are the file ids.
@@ -73,13 +80,48 @@ class cleanup_files extends \core\task\scheduled_task {
     }
 
     /**
-     * File ids the stored trees of a course refer to, read now.
+     * File ids a deletion must spare in a course: those named by any stored value, valid tree or not.
+     *
+     * Every text of {@see manager::get_course_stored_values()} that decodes as JSON is walked at any depth, so a
+     * tree that does not validate, or one stored by a method that is not installed, still keeps its files.
      *
      * @param int $courseid
-     * @return bool[] Keys are the file ids.
+     * @return bool[]|null Keys are the file ids; null when a value names a file but cannot be read, or a method
+     *     could not be asked for its value: nothing is known about the course, which is never read as "no file".
      */
-    protected function read_references(int $courseid): array {
-        return self::get_referenced_fileids($courseid);
+    public static function get_spared_fileids(int $courseid): ?array {
+        try {
+            $texts = manager::get_course_stored_values($courseid);
+        } catch (\Throwable $e) {
+            return null;
+        }
+        $ids = [];
+        foreach ($texts as $text) {
+            $data = json_decode($text, true);
+            if (!is_array($data)) {
+                // A text that never names a file (a welcome message of a missing method) is no reference.
+                if (str_contains($text, '"fileid"')) {
+                    return null;
+                }
+                continue;
+            }
+            array_walk_recursive($data, function ($value, $key) use (&$ids): void {
+                if ($key === 'fileid' && (int) $value > 0) {
+                    $ids[(int) $value] = true;
+                }
+            });
+        }
+        return $ids;
+    }
+
+    /**
+     * File ids a deletion must spare in a course, read now.
+     *
+     * @param int $courseid
+     * @return bool[]|null Keys are the file ids; null when the course cannot be read, see {@see get_spared_fileids()}.
+     */
+    protected function read_references(int $courseid): ?array {
+        return self::get_spared_fileids($courseid);
     }
 
     #[\Override]
@@ -98,14 +140,25 @@ class cleanup_files extends \core\task\scheduled_task {
         $referenced = [];
         $fs = get_file_storage();
         $deleted = 0;
+        $skipped = [];
         foreach ($records as $record) {
             $courseid = (int) $record->courseid;
-            $referenced[$courseid] ??= $this->read_references($courseid);
+            if (!array_key_exists($courseid, $referenced)) {
+                $referenced[$courseid] = $this->read_references($courseid);
+            }
+            if ($referenced[$courseid] === null) {
+                $skipped[$courseid] = true;
+                continue;
+            }
             if (isset($referenced[$courseid][(int) $record->itemid])) {
                 continue;
             }
             // The list was read before this file's turn: a tree saved meanwhile may use it now.
             $referenced[$courseid] = $this->read_references($courseid);
+            if ($referenced[$courseid] === null) {
+                $skipped[$courseid] = true;
+                continue;
+            }
             if (isset($referenced[$courseid][(int) $record->itemid])) {
                 continue;
             }
@@ -118,5 +171,8 @@ class cleanup_files extends \core\task\scheduled_task {
             }
         }
         mtrace("$deleted files of usernames deleted.");
+        if ($skipped) {
+            mtrace('Files of ' . count($skipped) . ' courses kept: a stored condition tree could not be read.');
+        }
     }
 }

@@ -94,7 +94,7 @@ Scheduled tasks and caches
 - `\local_enrolconditions\task\purge_orphan_states`: runs once a day, deletes the state records whose user enrolment or enrolment instance no longer exists.
 - Adhoc task `\local_enrolconditions\task\recheck_user`: queued by the observer, one per user, when an event of the "events" check mode fires; the enrolment changes when this task runs, not in the request that fired the event. A task queued by a task goes one level deeper, up to 5, so two instances that depend on each other cannot loop.
 - Locks: the enforcer takes a lock per user enrolment through `\core\lock\lock_config` before it records or reverts a suspension. A cluster needs a lock factory shared by every node, which core's default (database) factory is.
-- `\enrolcond_userfile\task\cleanup_files`: runs once a day, deletes the username files that no condition refers to any more (files younger than a day are kept).
+- `\enrolcond_userfile\task\cleanup_files`: runs once a day, deletes the username files that no condition refers to any more (files younger than a day are kept; a file named by a stored tree that cannot be evaluated, such as one that does not validate or one of a method that is not installed, is kept too).
 - Cache `local_enrolconditions/observedevents` (application, time to live one hour as a backstop): the events observed by the instances that re-check on events; purged when an instance changes.
 - Cache `enrolcond_userfile/usernames` (application): the usernames of a file, by its content hash.
 - Cache `enrolcond_sqlquery/results` (application): the usernames a query returned, for the time set above.

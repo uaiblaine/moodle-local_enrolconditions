@@ -285,6 +285,271 @@ final class userfile_test extends \core_privacy\tests\provider_testcase {
         $this->assertNull(condition::get_file($unused, $context));
     }
 
+    /**
+     * Makes every file of usernames old enough for the cleanup task.
+     */
+    protected function age_files(): void {
+        global $DB;
+        $DB->set_field('files', 'timemodified', time() - 2 * DAYSECS, ['component' => condition::COMPONENT]);
+    }
+
+    /**
+     * Runs the cleanup task and returns what it printed.
+     *
+     * @param \enrolcond_userfile\task\cleanup_files|null $task A subclass to run instead of the task.
+     * @return string
+     */
+    protected function run_cleanup(?\enrolcond_userfile\task\cleanup_files $task = null): string {
+        ob_start();
+        ($task ?? new \enrolcond_userfile\task\cleanup_files())->execute();
+        return ob_get_clean();
+    }
+
+    /**
+     * JSON of a valid tree with one userfile condition.
+     *
+     * @param int $fileid
+     * @return string
+     */
+    protected function tree_naming(int $fileid): string {
+        return json_encode(['op' => 'and', 'children' => [
+            ['type' => 'userfile', 'config' => ['fileid' => $fileid]],
+        ]]);
+    }
+
+    /**
+     * Adds an enrolment instance of a method no plugin provides.
+     *
+     * @param \stdClass $course
+     * @param array $columns Custom columns to fill.
+     */
+    protected function add_missing_method_instance(\stdClass $course, array $columns): void {
+        global $DB;
+        $this->assertNull(enrol_get_plugin('zzmissing'));
+        $DB->insert_record('enrol', (object) ($columns + [
+            'enrol' => 'zzmissing',
+            'status' => ENROL_INSTANCE_ENABLED,
+            'courseid' => $course->id,
+            'sortorder' => 99,
+            'timecreated' => time(),
+            'timemodified' => time(),
+        ]));
+    }
+
+    public function test_cleanup_keeps_a_file_a_tree_that_does_not_validate_names(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $named = $this->save($course, "ana\n");
+        $unnamed = $this->save($course, "bia\n");
+        // An unknown operator: the value is JSON and names the file, but tree::from_json() refuses it.
+        $DB->set_field('enrol', 'customtext1', json_encode(['op' => 'xor', 'children' => [
+            ['type' => 'userfile', 'config' => ['fileid' => $named['fileid']]],
+        ]]), ['courseid' => $course->id, 'enrol' => 'manual']);
+        $this->assertSame([], \local_enrolconditions\condition\manager::get_course_trees((int) $course->id));
+        $this->age_files();
+
+        $this->assertMatchesRegularExpression('/^1 files of usernames deleted\./', $this->run_cleanup());
+        $context = \context_course::instance($course->id);
+        $this->assertNotNull(condition::get_file($named, $context));
+        // Control: the old file nothing names goes.
+        $this->assertNull(condition::get_file($unnamed, $context));
+    }
+
+    public function test_cleanup_keeps_a_file_an_instance_of_a_missing_method_names(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $course = $this->getDataGenerator()->create_course();
+        $named = $this->save($course, "ana\n");
+        $unnamed = $this->save($course, "bia\n");
+        $this->add_missing_method_instance($course, ['customtext2' => $this->tree_naming($named['fileid'])]);
+        $this->age_files();
+
+        $this->assertMatchesRegularExpression('/^1 files of usernames deleted\./', $this->run_cleanup());
+        $context = \context_course::instance($course->id);
+        $this->assertNotNull(condition::get_file($named, $context));
+        // Control: the old file nothing names goes.
+        $this->assertNull(condition::get_file($unnamed, $context));
+    }
+
+    public function test_cleanup_ignores_the_columns_of_an_installed_method_without_trees(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->assertNull(\local_enrolconditions\condition\manager::get_enforceable('manual'));
+        $course = $this->getDataGenerator()->create_course();
+        $other = $this->getDataGenerator()->create_course();
+        $file = $this->save($course, "ana\n");
+        $control = $this->save($other, "bia\n");
+        // The manual method is installed and stores no trees: its columns protect nothing.
+        $DB->set_field(
+            'enrol',
+            'customtext1',
+            $this->tree_naming($file['fileid']),
+            ['courseid' => $course->id, 'enrol' => 'manual']
+        );
+        // Control: the same value in a column of a method that is not installed keeps the file.
+        $this->add_missing_method_instance($other, ['customtext1' => $this->tree_naming($control['fileid'])]);
+        $this->age_files();
+
+        $this->assertMatchesRegularExpression('/^1 files of usernames deleted\./', $this->run_cleanup());
+        $this->assertNull(condition::get_file($file, \context_course::instance($course->id)));
+        $this->assertNotNull(condition::get_file($control, \context_course::instance($other->id)));
+    }
+
+    public function test_cleanup_deletes_nothing_of_a_course_whose_stored_value_cannot_be_read(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $other = $this->getDataGenerator()->create_course();
+        $named = $this->save($course, "ana\n");
+        $unnamed = $this->save($course, "bia\n");
+        $control = $this->save($other, "carla\n");
+        // A truncated tree: it names a file and is not JSON.
+        $truncated = substr($this->tree_naming($named['fileid']), 0, -8);
+        $this->assertStringContainsString('"fileid"', $truncated);
+        $this->assertNull(json_decode($truncated, true));
+        $DB->set_field('enrol', 'customtext1', $truncated, ['courseid' => $course->id, 'enrol' => 'manual']);
+        $this->age_files();
+
+        $output = $this->run_cleanup();
+        $this->assertStringContainsString('1 files of usernames deleted.', $output);
+        $this->assertStringContainsString('Files of 1 courses kept: a stored condition tree could not be read.', $output);
+        $context = \context_course::instance($course->id);
+        $this->assertNotNull(condition::get_file($named, $context));
+        $this->assertNotNull(condition::get_file($unnamed, $context));
+        // Control: the old file of another course, which nothing names, goes in the same run.
+        $this->assertNull(condition::get_file($control, \context_course::instance($other->id)));
+
+        // The teacher fixes the value: the next run deletes what nothing names.
+        $this->store($course, $named);
+        $output = $this->run_cleanup();
+        $this->assertStringContainsString('1 files of usernames deleted.', $output);
+        $this->assertStringNotContainsString('kept', $output);
+        $this->assertNotNull(condition::get_file($named, $context));
+        $this->assertNull(condition::get_file($unnamed, $context));
+    }
+
+    public function test_cleanup_deletes_nothing_of_a_course_whose_method_cannot_be_asked(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $other = $this->getDataGenerator()->create_course();
+        $unnamed = $this->save($course, "ana\n");
+        $control = $this->save($other, "bia\n");
+        $DB->set_field('enrol', 'customchar1', 'throwtree', ['courseid' => $course->id, 'enrol' => 'manual']);
+        try {
+            \local_enrolconditions\condition\manager::get_course_stored_values((int) $course->id);
+            $this->fail('The method of the instance should have thrown.');
+        } catch (\TypeError $e) {
+            $this->assertSame('Broken enrolment method', $e->getMessage());
+        }
+        $this->age_files();
+
+        $output = $this->run_cleanup();
+        $this->assertStringContainsString('1 files of usernames deleted.', $output);
+        $this->assertStringContainsString('Files of 1 courses kept: a stored condition tree could not be read.', $output);
+        $this->assertNotNull(condition::get_file($unnamed, \context_course::instance($course->id)));
+        // Control: the old file of another course, which nothing names, goes in the same run.
+        $this->assertNull(condition::get_file($control, \context_course::instance($other->id)));
+
+        // The method answers again: the file nothing names goes.
+        $DB->set_field('enrol', 'customchar1', '', ['courseid' => $course->id, 'enrol' => 'manual']);
+        $this->assertStringContainsString('1 files of usernames deleted.', $this->run_cleanup());
+        $this->assertNull(condition::get_file($unnamed, \context_course::instance($course->id)));
+    }
+
+    public function test_cleanup_keeps_a_file_that_becomes_unreadable_before_its_deletion(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $other = $this->getDataGenerator()->create_course();
+        $file = $this->save($course, "ana\n");
+        $control = $this->save($other, "bia\n");
+        $this->age_files();
+        // The stored value of the first course is cut after the task read it, before the deletion reads it again.
+        $break = fn() => $DB->set_field(
+            'enrol',
+            'customtext1',
+            '{"op":"and","children":[{"type":"userfile","config":{"fileid":',
+            ['courseid' => $course->id, 'enrol' => 'manual']
+        );
+        $task = new class ((int) $course->id, $break) extends \enrolcond_userfile\task\cleanup_files {
+            /** @var array The answers given for the watched course. */
+            public array $answers = [];
+
+            /**
+             * Constructor.
+             *
+             * @param int $watched Course whose stored value is cut after its first read.
+             * @param \Closure $break Cuts the stored value.
+             */
+            public function __construct(
+                /** @var int */
+                protected int $watched,
+                /** @var \Closure */
+                protected \Closure $break,
+            ) {
+            }
+
+            /**
+             * Reads the references, and cuts the watched course's stored value right after the first read.
+             *
+             * @param int $courseid
+             * @return bool[]|null
+             */
+            protected function read_references(int $courseid): ?array {
+                $ids = parent::read_references($courseid);
+                if ($courseid === $this->watched) {
+                    $this->answers[] = $ids;
+                    if (count($this->answers) === 1) {
+                        ($this->break)();
+                    }
+                }
+                return $ids;
+            }
+        };
+
+        $output = $this->run_cleanup($task);
+        // The first read answered, the second could not.
+        $this->assertSame([[], null], $task->answers);
+        $this->assertStringContainsString('1 files of usernames deleted.', $output);
+        $this->assertStringContainsString('Files of 1 courses kept', $output);
+        $this->assertNotNull(condition::get_file($file, \context_course::instance($course->id)));
+        // Control: the old file of another course, which nothing names, goes.
+        $this->assertNull(condition::get_file($control, \context_course::instance($other->id)));
+    }
+
+    public function test_check_access_ignores_a_stored_value_that_does_not_validate(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $context = \context_course::instance($course->id);
+        $condition = new condition();
+        $named = $this->save($course, "ana\n");
+        $fresh = $this->save($course, "bia\n");
+        $DB->set_field('enrol', 'customtext1', json_encode(['op' => 'xor', 'children' => [
+            ['type' => 'userfile', 'config' => ['fileid' => $named['fileid']]],
+        ]]), ['courseid' => $course->id, 'enrol' => 'manual']);
+
+        // The rule of check_access() is the trees in force: a value that does not validate is not one.
+        $this->assertSame([], \enrolcond_userfile\task\cleanup_files::get_referenced_fileids((int) $course->id));
+        $this->assertNull($condition->check_access($fresh, $context));
+        // Control: a valid tree naming the file makes it refused.
+        $this->store($course, $named);
+        $this->assertSame(get_string('noaccess', condition::COMPONENT), $condition->check_access($named, $context));
+    }
+
     public function test_check_access_refuses_a_file_another_teacher_uploaded(): void {
         $this->resetAfterTest();
         $this->use_fake_enforceable();
