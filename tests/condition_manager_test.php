@@ -175,6 +175,47 @@ final class condition_manager_test extends \advanced_testcase {
         $this->assertSame([1], reset($trees)->to_array()['children'][0]['config']['userids']);
     }
 
+    public function test_get_course_stored_values(): void {
+        global $DB;
+        require_once(__DIR__ . '/fixtures/fake_enforceable.php');
+        manager::register_enforceable_for_testing('manual', new \local_enrolconditions_fake_enforceable());
+        $course = $this->getDataGenerator()->create_course();
+        $row = fn(string $enrol, array $columns) => $DB->insert_record('enrol', (object) ($columns + [
+            'enrol' => $enrol,
+            'status' => ENROL_INSTANCE_ENABLED,
+            'courseid' => $course->id,
+            'sortorder' => 50,
+            'timecreated' => time(),
+            'timemodified' => time(),
+        ]));
+
+        // A course without any stored text has no values: the manual instance of the course stores none.
+        $this->assertSame([], manager::get_course_stored_values((int) $course->id));
+
+        // An installed method that stores trees gives its text, valid or not.
+        $DB->set_field('enrol', 'customtext1', '{"op":"xor","children":[]}', ['courseid' => $course->id, 'enrol' => 'manual']);
+        $this->assertSame(['{"op":"xor","children":[]}'], manager::get_course_stored_values((int) $course->id));
+        $this->assertSame([], manager::get_course_trees((int) $course->id));
+
+        // An installed method that stores no trees gives nothing, whatever its columns hold.
+        $this->assertNotNull(enrol_get_plugin('self'));
+        $this->assertNull(manager::get_enforceable('self'));
+        $row('self', ['customtext1' => '{"fileid":1}', 'customchar1' => 'self text']);
+
+        // A method that is not installed gives every custom column that holds a string, and drops the empty ones.
+        $this->assertNull(enrol_get_plugin('zzmissing'));
+        $row('zzmissing', ['customtext2' => '{"fileid":2}', 'customchar3' => 'welcome', 'customtext1' => '', 'customint1' => 7]);
+        $this->assertEqualsCanonicalizing(
+            ['{"op":"xor","children":[]}', '{"fileid":2}', 'welcome', '7'],
+            manager::get_course_stored_values((int) $course->id)
+        );
+
+        // The text of a method that cannot be asked is not swallowed.
+        $DB->set_field('enrol', 'customchar1', 'throwtree', ['courseid' => $course->id, 'enrol' => 'manual']);
+        $this->expectException(\TypeError::class);
+        manager::get_course_stored_values((int) $course->id);
+    }
+
     public function test_admin_pages(): void {
         $this->setAdminUser();
         $root = admin_get_root(true, true);
