@@ -25,8 +25,8 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'local_enrolconditions';
-$plugin->version = 2026112301;
+$plugin->version = 2026112700;
 $plugin->requires = 2026100200;
 $plugin->supported = [503, 503];
-$plugin->release = '1.2.0+uai.2';
+$plugin->release = '1.2.0+uai.3';
 $plugin->maturity = MATURITY_STABLE;
