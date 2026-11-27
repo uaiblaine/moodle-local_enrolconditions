@@ -99,8 +99,9 @@ class cleanup_files extends \core\task\scheduled_task {
         foreach ($texts as $text) {
             $data = json_decode($text, true);
             if (!is_array($data)) {
-                // A text that never names a file (a welcome message of a missing method) is no reference.
-                if (str_contains($text, '"fileid"')) {
+                // A text that never names a file (a welcome message of a missing method) is no reference. The key is
+                // looked for without its quotes: a value encoded twice spells it \"fileid\".
+                if (str_contains($text, 'fileid')) {
                     return null;
                 }
                 continue;

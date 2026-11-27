@@ -434,6 +434,29 @@ final class userfile_test extends \core_privacy\tests\provider_testcase {
         $this->assertNull(condition::get_file($unnamed, $context));
     }
 
+    public function test_cleanup_deletes_nothing_of_a_course_whose_value_names_a_file_only_escaped(): void {
+        global $DB;
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->use_fake_enforceable();
+        $course = $this->getDataGenerator()->create_course();
+        $other = $this->getDataGenerator()->create_course();
+        $named = $this->save($course, "ana\n");
+        $control = $this->save($other, "carla\n");
+        // A tree encoded twice: it decodes to a string, and its key is spelt \"fileid\", never "fileid".
+        $encoded = json_encode($this->tree_naming($named['fileid']));
+        $this->assertIsString(json_decode($encoded, true));
+        $this->assertStringNotContainsString('"fileid"', $encoded);
+        $DB->set_field('enrol', 'customtext1', $encoded, ['courseid' => $course->id, 'enrol' => 'manual']);
+        $this->age_files();
+
+        $output = $this->run_cleanup();
+        $this->assertStringContainsString('Files of 1 courses kept: a stored condition tree could not be read.', $output);
+        $this->assertNotNull(condition::get_file($named, \context_course::instance($course->id)));
+        // Control: the old file of another course, which nothing names, goes in the same run.
+        $this->assertNull(condition::get_file($control, \context_course::instance($other->id)));
+    }
+
     public function test_cleanup_deletes_nothing_of_a_course_whose_method_cannot_be_asked(): void {
         global $DB;
         $this->resetAfterTest();
